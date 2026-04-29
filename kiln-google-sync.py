@@ -117,11 +117,39 @@ def tail_csv_and_sync(csv_file, credentials_file, spreadsheet_id, sheet_name, po
 
     print(f"Starting to monitor {csv_file} for changes...")
     print(f"Will append new data to Google Sheets sheet: '{sheet_name}'")
+    print()
+
+    # Check if file exists and has content
+    if os.path.exists(csv_file) and last_size > 0:
+        with open(csv_file, 'r') as f:
+            lines = f.readlines()
+            num_lines = len([line for line in lines if line.strip()])
+            
+        if num_lines > 0:
+            print(f"Found {num_lines} existing line(s) in {csv_file}")
+            response = input("Do you want to upload existing data to Google Sheets before monitoring new changes? (y/n) [default: n]: ").strip().lower()
+            
+            if response == 'y':
+                print(f"Uploading {num_lines} existing line(s)...")
+                with open(csv_file, 'r') as f:
+                    for line in f:
+                        if line.strip():  # Skip empty lines
+                            reader = csv.reader([line])
+                            row = next(reader)
+                            if row:  # Only append non-empty rows
+                                append_to_sheet(service, spreadsheet_id, sheet_name, row)
+                print(f"Finished uploading existing data")
+                print()
+            
+            # Set position to end of file to monitor only new changes
+            last_position = last_size
+    
+    print("Monitoring for new changes...")
 
     while True:
         try:
             if not os.path.exists(csv_file):
-                print(f"CSV file {csv_file} does not exist yet. Waiting...")
+                print(f"CSV file {csv_file} does not exist. Waiting...")
                 time.sleep(poll_interval)
                 continue
 
@@ -150,7 +178,7 @@ def tail_csv_and_sync(csv_file, credentials_file, spreadsheet_id, sheet_name, po
             time.sleep(poll_interval)
 
         except KeyboardInterrupt:
-            print("Stopping CSV monitoring...")
+            print("\nStopping CSV monitoring...")
             break
         except Exception as e:
             print(f"Error monitoring CSV: {e}")
@@ -165,7 +193,7 @@ def main():
     parser.add_argument('--spreadsheet-id', type=str, required=True,
                         help='Google Sheets spreadsheet ID')
     parser.add_argument('--sheet-name', type=str, default='Sheet1',
-                        help='Name of the sheet to append data to (default: Sheet1)')
+                        help='Name of the sheet to append data to (IMPORTANT: check your Google Sheet tabs!)')
     parser.add_argument('--poll-interval', type=float, default=1.0,
                         help='How often to check for new CSV data in seconds (default: 1.0)')
     parser.add_argument('--test-google-sheets', action='store_true',

@@ -51,6 +51,14 @@ python kiln-google-sync.py \
     --csvfile /tmp/kilnstats.csv
 ```
 
+When you start the sync script, if there's existing data in the CSV file, you'll be prompted:
+```
+Do you want to upload existing data to Google Sheets before monitoring new changes? (y/n) [default: n]:
+```
+
+- Answer `y` to upload all existing data to the spreadsheet (useful for backfilling after a restart)
+- Answer `n` or just press Enter to skip and only monitor new changes
+
 ## Testing
 
 Before running the sync with real kiln data, test your Google Sheets connection:

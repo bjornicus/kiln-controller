@@ -23,3 +23,8 @@ adafruit-circuitpython-bitbangio
 
 # untested - for mcp9600 and mcp9601
 #adafruit-circuitpython-mcp9600
+
+# Google Sheets API dependencies
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2

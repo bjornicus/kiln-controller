@@ -51,6 +51,17 @@ python kiln-google-sync.py \
     --csvfile /tmp/kilnstats.csv
 ```
 
+If you don't want every data point uploaded to google sheets, but instead want a regular sampling, you can use the `--upload-every-nth` option.  For example, if your kiln logger is writing every 2 seconds and you want to upload only one row per minute, use:
+
+```bash
+python kiln-google-sync.py \
+    --credentials /path/to/service-account-key.json \
+    --spreadsheet-id YOUR_SPREADSHEET_ID \
+    --sheet-name sheet1 \
+    --csvfile /tmp/kilnstats.csv \
+    --upload-every-nth 30
+```
+
 When you start the sync script, if there's existing data in the CSV file, you'll be prompted:
 ```
 Do you want to upload existing data to Google Sheets before monitoring new changes? (y/n) [default: n]:
@@ -84,6 +95,7 @@ This will:
 - `--spreadsheet-id`: Your Google Sheets spreadsheet ID (required)
 - `--sheet-name`: Name of the sheet to append data to (IMPORTANT: check your Google Sheet tabs!)
 - `--poll-interval`: How often to check for new data in seconds (default: 1.0)
+- `--upload-every-nth`: Only upload every nth CSV data row (default: 1 = upload all rows)
 - `--test-google-sheets`: Test the Google Sheets connection by appending a test row and exit (doesn't require --csvfile)
 
 ## CSV Data Format

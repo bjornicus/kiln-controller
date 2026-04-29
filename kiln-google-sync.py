@@ -19,6 +19,14 @@ def get_google_sheets_service(credentials_file):
     service = build('sheets', 'v4', credentials=creds)
     return service
 
+
+def parse_positive_int(value):
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    return ivalue
+
+
 def append_to_sheet(service, spreadsheet_id, sheet_name, row_data):
     """Append a row of data to the specified Google Sheet."""
     try:
@@ -107,9 +115,13 @@ def test_google_sheets(credentials_file, spreadsheet_id, sheet_name):
         print(f"✗ Error: {e}")
         return False
 
-def tail_csv_and_sync(csv_file, credentials_file, spreadsheet_id, sheet_name, poll_interval=1):
+def tail_csv_and_sync(csv_file, credentials_file, spreadsheet_id, sheet_name, poll_interval=1, upload_every_nth=1):
     """Tail the CSV file and sync new rows to Google Sheets."""
     service = get_google_sheets_service(credentials_file)
+
+    # Track how many data rows have been seen so we only upload every nth entry.
+    rows_processed = 0
+    header_uploaded = False
 
     # Get the initial file size
     last_size = os.path.getsize(csv_file) if os.path.exists(csv_file) else 0
@@ -122,8 +134,8 @@ def tail_csv_and_sync(csv_file, credentials_file, spreadsheet_id, sheet_name, po
     # Check if file exists and has content
     if os.path.exists(csv_file) and last_size > 0:
         with open(csv_file, 'r') as f:
-            lines = f.readlines()
-            num_lines = len([line for line in lines if line.strip()])
+            lines = [line for line in f if line.strip()]
+            num_lines = len(lines)
             
         if num_lines > 0:
             print(f"Found {num_lines} existing line(s) in {csv_file}")
@@ -136,10 +148,28 @@ def tail_csv_and_sync(csv_file, credentials_file, spreadsheet_id, sheet_name, po
                         if line.strip():  # Skip empty lines
                             reader = csv.reader([line])
                             row = next(reader)
-                            if row:  # Only append non-empty rows
+                            if not header_uploaded and row:
                                 append_to_sheet(service, spreadsheet_id, sheet_name, row)
+                                header_uploaded = True
+                                continue
+                            if row:
+                                rows_processed += 1
+                                if rows_processed % upload_every_nth == 0:
+                                    append_to_sheet(service, spreadsheet_id, sheet_name, row)
                 print(f"Finished uploading existing data")
                 print()
+            else:
+                with open(csv_file, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            reader = csv.reader([line])
+                            row = next(reader)
+                            if not header_uploaded and row:
+                                append_to_sheet(service, spreadsheet_id, sheet_name, row)
+                                header_uploaded = True
+                                continue
+                            if row:
+                                rows_processed += 1
             
             # Set position to end of file to monitor only new changes
             last_position = last_size
@@ -170,8 +200,14 @@ def tail_csv_and_sync(csv_file, credentials_file, spreadsheet_id, sheet_name, po
                             # Parse CSV line
                             reader = csv.reader([line])
                             row = next(reader)
-                            if row:  # Only append non-empty rows
+                            if not header_uploaded and row:
                                 append_to_sheet(service, spreadsheet_id, sheet_name, row)
+                                header_uploaded = True
+                                continue
+                            if row:
+                                rows_processed += 1
+                                if rows_processed % upload_every_nth == 0:
+                                    append_to_sheet(service, spreadsheet_id, sheet_name, row)
 
                 last_size = current_size
 
@@ -196,6 +232,8 @@ def main():
                         help='Name of the sheet to append data to (IMPORTANT: check your Google Sheet tabs!)')
     parser.add_argument('--poll-interval', type=float, default=1.0,
                         help='How often to check for new CSV data in seconds (default: 1.0)')
+    parser.add_argument('--upload-every-nth', type=parse_positive_int, default=1,
+                        help='Only upload every nth CSV data row (default: 1 = upload all rows)')
     parser.add_argument('--test-google-sheets', action='store_true',
                         help='Test Google Sheets connection by appending a test row and exit')
 
@@ -210,7 +248,8 @@ def main():
             args.credentials,
             args.spreadsheet_id,
             args.sheet_name,
-            args.poll_interval
+            args.poll_interval,
+            args.upload_every_nth
         )
 
 if __name__ == '__main__':

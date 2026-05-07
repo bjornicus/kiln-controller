@@ -40,7 +40,7 @@ def append_to_sheet(service, spreadsheet_id, sheet_name, row_data):
         result = service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
             range=f'{sheet_name}!A:A',  # Append starting from column A
-            valueInputOption='RAW',
+            valueInputOption='USER_ENTERED',
             body=body
         ).execute()
 

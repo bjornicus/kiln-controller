@@ -84,11 +84,11 @@ currency_type   = "$"   # Currency Symbol to show when calculating cost to run j
 
 try:
     import board
-    spi_sclk  = board.D17    #spi clock
-    spi_miso  = board.D27    #spi Microcomputer In Serial Out
-    spi_cs    = board.D22    #spi Chip Select
+    spi_sclk  = board.D22    #spi clock
+    spi_miso  = board.D17    #spi Microcomputer In Serial Out
+    spi_cs    = board.D27    #spi Chip Select
     spi_mosi  = board.D10    #spi Microcomputer Out Serial In (not connected) 
-    gpio_heat = board.D23    #output that controls relay
+    gpio_heat = board.D26    #output that controls relay
     gpio_heat_invert = False #invert the output state
 except (NotImplementedError,AttributeError):
     print("not running on blinka recognized board, probably a simulation")
@@ -140,9 +140,15 @@ sensor_time_wait = 2
 # well with the simulated oven. You must tune them to work well with 
 # your specific kiln. Note that the integral pid_ki is
 # inverted so that a smaller number means more integral action.
-pid_kp = 10   # Proportional 25,200,200
-pid_ki = 80   # Integral
-pid_kd = 220.83497910261562 # Derivative
+# Defaults:
+# pid_kp = 10   # Proportional 25,200,200
+# pid_ki = 80   # Integral
+# pid_kd = 220.83497910261562 # Derivative
+
+# Bjorn's Kiln:
+pid_kp = 11.55712276896449
+pid_ki = 22.2339035173517
+pid_kd = 742.4294296782531
 
 ########################################################################
 #
@@ -155,7 +161,7 @@ stop_integral_windup = True
 ########################################################################
 #
 #   Simulation parameters
-simulate = True
+simulate = False
 sim_t_env      = 65   # deg
 sim_c_heat     = 500.0  # J/K  heat capacity of heat element
 sim_c_oven     = 5000.0 # J/K  heat capacity of oven

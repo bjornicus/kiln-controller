@@ -28,10 +28,15 @@ def parse_positive_int(value):
 
 
 def append_to_sheet(service, spreadsheet_id, sheet_name, row_data):
-    """Append a row of data to the specified Google Sheet."""
+    """Append row(s) of data to the specified Google Sheet."""
     try:
         # Prepare the data for the API
-        values = [row_data]
+        # row_data can be a single row (list) or multiple rows (list of lists)
+        if isinstance(row_data[0], list):
+            values = row_data  # Multiple rows
+        else:
+            values = [row_data]  # Single row
+        
         body = {
             'values': values
         }
@@ -44,7 +49,7 @@ def append_to_sheet(service, spreadsheet_id, sheet_name, row_data):
             body=body
         ).execute()
 
-        print(f"Appended row to Google Sheets '{sheet_name}': {row_data}")
+        print(f"Appended {len(values)} row(s) to Google Sheets '{sheet_name}': {values}")
         return result
 
     except HttpError as err:
@@ -143,19 +148,22 @@ def tail_csv_and_sync(csv_file, credentials_file, spreadsheet_id, sheet_name, po
             
             if response == 'y':
                 print(f"Uploading {num_lines} existing line(s)...")
+                batch_rows = []
                 with open(csv_file, 'r') as f:
                     for line in f:
                         if line.strip():  # Skip empty lines
                             reader = csv.reader([line])
                             row = next(reader)
                             if not header_uploaded and row:
-                                append_to_sheet(service, spreadsheet_id, sheet_name, row)
+                                batch_rows.append(row)
                                 header_uploaded = True
                                 continue
                             if row:
                                 rows_processed += 1
                                 if rows_processed % upload_every_nth == 0:
-                                    append_to_sheet(service, spreadsheet_id, sheet_name, row)
+                                    batch_rows.append(row)
+                if batch_rows:
+                    append_to_sheet(service, spreadsheet_id, sheet_name, batch_rows)
                 print(f"Finished uploading existing data")
                 print()
             else:

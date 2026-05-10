@@ -5,6 +5,7 @@ import logging
 import json
 import config
 import os
+import math
 import digitalio
 import busio
 import adafruit_bitbangio as bitbangio
@@ -102,13 +103,43 @@ class TempSensor(threading.Thread):
         self.daemon = True
         self.time_step = config.sensor_time_wait
         self.status = ThermocoupleTracker()
+        self.stat_buckets = {}
+
+    def _bucket_temperature(self, temp):
+        return int(math.floor(temp / 10.0) * 10)
+
+    def _get_stat_bucket(self, bucket):
+        bucket_map = self.stat_buckets.get(bucket)
+        if bucket_map is None:
+            bucket_map = {}
+            self.stat_buckets[bucket] = bucket_map
+        return bucket_map
+
+    def track_read_success(self):
+        self.track_result("success")
+
+    def track_read_error(self, message):
+        self.track_result(message)
+
+    def track_result(self, message):
+        bucket = self._bucket_temperature(self.temperature())
+        bucket_map = self._get_stat_bucket(bucket)
+        bucket_map[message] = bucket_map.get(message, 0) + 1
+
+    def get_reading_stats(self):
+        return {
+            str(bucket): dict(messages)
+            for bucket, messages in self.stat_buckets.items()
+        }
 
 class TempSensorSimulated(TempSensor):
     '''Simulates a temperature sensor '''
     def __init__(self):
         TempSensor.__init__(self)
         self.simulated_temperature = config.sim_t_env
+        self.temperature_read_count = 0
     def temperature(self):
+        self.temperature_read_count += 1
         return self.simulated_temperature
 
 class TempSensorReal(TempSensor):
@@ -142,8 +173,10 @@ class TempSensorReal(TempSensor):
             if config.temp_scale.lower() == "f":
                 temp = (temp*9/5)+32
             self.status.good()
+            self.track_read_success()
             return temp
         except ThermocoupleError as tce:
+            self.track_read_error(tce.message)
             if tce.ignore:
                 log.error("Problem reading temp (ignored) %s" % (tce.message))
                 self.status.good()
@@ -632,9 +665,16 @@ class SimulatedOven(Oven):
 
     def heat_then_cool(self):
         now_simulator = self.start_time + datetime.timedelta(milliseconds = self.runtime * 1000)
-        pid = self.pid.compute(self.target,
-                               self.board.temp_sensor.temperature() +
-                               config.thermocouple_offset, now_simulator)
+        temperature = self.board.temp_sensor.temperature() + config.thermocouple_offset
+        if self.board.temp_sensor.temperature_read_count % 7 == 0: 
+            self.board.temp_sensor.track_read_error("read error 7")
+            log.error("simulated read error")
+        elif self.board.temp_sensor.temperature_read_count % 11 == 0:
+            self.board.temp_sensor.track_read_error("read error 11")
+            log.error("simulated read error")
+        else:
+            self.board.temp_sensor.track_read_success()
+        pid = self.pid.compute(self.target, temperature, now_simulator)
 
         heat_on = float(self.time_step * pid)
         heat_off = float(self.time_step * (1 - pid))

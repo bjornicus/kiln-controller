@@ -55,6 +55,18 @@ def handle_api():
         if hasattr(oven.pid,'pidstats'):
             return json.dumps(oven.pid.pidstats)
 
+@app.get('/api/kilnlog')
+def handle_api_kilnlog():
+    log.info("/api/kilnlog command received")
+    if hasattr(ovenWatcher,'last_log'):
+        return json.dumps(ovenWatcher.lastlog_subset())
+    
+@app.get('/tcstats')
+def handle_tcstats():
+    log.info("/tcstats command received")
+    result = oven.board.temp_sensor.get_reading_stats()
+    log.info("tcstats result: %s" % result)
+    return result
 
 @app.post('/api')
 def handle_api():

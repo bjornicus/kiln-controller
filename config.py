@@ -187,9 +187,17 @@ time_scale_profile  = "m" # s = Seconds | m = Minutes | h = Hours - Enter and vi
 # this should not replace you watching your kiln or use of a kiln-sitter
 emergency_shutoff_temp = 2264 #cone 7
 
-# If the current temperature is outside the pid control window,
-# delay the schedule until it does back inside. This allows for heating
-# and cooling as fast as possible and not continuing until temp is reached.
+# If the current temperature is below the pid control window,
+# delay the schedule (hold the clock) until the kiln heats back up
+# inside the window. This prevents the kiln from falling behind the
+# schedule.
+#
+# When the kiln is too hot (actual temp above the window):
+#  - on a heating/plateau segment (overshoot) the schedule is NOT delayed.
+#    The clock keeps advancing so the rising target meets the cooling actual
+#    temperature, then heating resumes.
+#  - on a cooling segment, the schedule IS held until the kiln cools back
+#    inside the window, so the actual temperature tracks the cooling ramp.
 kiln_must_catch_up = True
 
 # This setting is required. 

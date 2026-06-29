@@ -402,8 +402,16 @@ class Oven(threading.Thread):
         return datetime.datetime.now() - datetime.timedelta(milliseconds = self.runtime * 1000)
 
     def kiln_must_catch_up(self):
-        '''shift the whole schedule forward in time by one time_step
-        to wait for the kiln to catch up'''
+        '''if the kiln is too cold, shift the whole schedule forward in time
+        by one time_step so it can heat up and catch up to the target.
+
+        When the kiln is too hot:
+        - on a heating/plateau segment, do NOT delay the schedule; it keeps
+          advancing so the rising target temperature meets the falling actual
+          temperature, then heating resumes.
+        - on a cooling segment (the schedule ramps down faster than the kiln
+          can cool), hold the schedule clock so the actual temperature tracks
+          the cooling ramp before time proceeds.'''
         if config.kiln_must_catch_up == True:
             temp = self.board.temp_sensor.temperature() + \
                 config.thermocouple_offset
@@ -413,13 +421,30 @@ class Oven(threading.Thread):
                 self.start_time = self.get_start_time()
                 self.catching_up = True;
                 return
-            # kiln too hot, wait for it to cool down
+            # kiln too hot
             if temp - self.target > config.pid_control_window:
-                log.info("kiln must catch up, too hot, shifting schedule")
-                self.start_time = self.get_start_time()
-                self.catching_up = True;
+                if self.schedule_is_cooling():
+                    log.info("kiln must catch up, too hot on cooling segment, holding schedule")
+                    self.start_time = self.get_start_time()
+                    self.catching_up = True;
+                    return
+                # heating or plateau: do NOT pause the schedule. Let it
+                # advance so the rising target meets the falling actual
+                # temperature, then heating resumes. (The PID already turns
+                # the heat off when actual temp is above target.)
+                self.catching_up = False;
                 return
             self.catching_up = False;
+
+    def schedule_is_cooling(self):
+        '''True if the current schedule segment is cooling (target falling).'''
+        try:
+            (prev_point, next_point) = self.profile.get_surrounding_points(self.runtime)
+            if prev_point is None or next_point is None:
+                return False
+            return next_point[1] < prev_point[1]
+        except Exception:
+            return False
 
     def update_runtime(self):
 

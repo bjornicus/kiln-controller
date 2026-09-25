@@ -1707,6 +1707,8 @@ def test_real_oven(monkeypatch):
 
     oven = oven_module().RealOven()
     assert oven.state == 'IDLE'
+    assert oven.clock is not None
+    assert oven.pid is not None
     assert oven.output is not None
     assert oven.board.name == 'TEST_BOARD'
 

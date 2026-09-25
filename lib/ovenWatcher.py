@@ -8,6 +8,13 @@ class OvenWatcher(threading.Thread):
         self.last_profile = None
         self.started = None
         self.observers = []
+        # The status websocket is also the catch-up mechanism for a client
+        # which connects after a firing has begun.  Keep one run in the
+        # controller, rather than relying on an individual browser's cache.
+        self.run_history = []
+        self.history_run_id = None
+        self.last_run_state = None
+        self.history_lock = threading.Lock()
         threading.Thread.__init__(self)
         self.daemon = True
         self.oven = oven
@@ -26,13 +33,7 @@ class OvenWatcher(threading.Thread):
         while True:
             oven_state = self.oven.get_state()
 
-            # stamp the run start time so clients can tell when a new run
-            # has begun (from the start button, a scheduled run, an api
-            # command, or an automatic restart)
-            if self.started:
-                oven_state['run_started'] = self.started.timestamp()
-            else:
-                oven_state['run_started'] = None
+            self.record_state(oven_state)
 
             if self.mqtt:
                 self.mqtt.publish(oven_state)
@@ -41,24 +42,70 @@ class OvenWatcher(threading.Thread):
             time.sleep(self.oven.time_step)
 
     def record(self, profile):
-        self.last_profile = profile
-        self.started = datetime.datetime.now()
+        with self.history_lock:
+            self.last_profile = profile
+            self.started = datetime.datetime.now()
+            # ``record`` is called immediately after every supported start
+            # path. Resetting here makes a new firing replace the previous
+            # one even before its first control-loop sample is available.
+            self.run_history = []
+            self.history_run_id = self.oven.get_state().get('run_id')
+            self.last_run_state = None
+
+    def record_state(self, state):
+        '''Keep the chart fields needed to replay the latest firing.
+
+        Full oven states are comparatively large and contain data that does
+        not vary per sample. This compact form retains the profile-time and
+        clock-time chart inputs, including PID diagnostics for Details.
+        '''
+        run_start = state.get('run_start_time')
+        if not run_start:
+            return
+        run_id = state.get('run_id')
+        sample = {
+            'run_start_time': run_start,
+            'initial_runtime': state.get('initial_runtime', 0),
+            'run_id': run_id,
+            'runtime': state.get('runtime'),
+            'temperature': state.get('temperature'),
+            'clock_time': state.get('clock_time'),
+            'catching_up': state.get('catching_up'),
+            'temp_errors': state.get('temp_errors'),
+            'pidstats': state.get('pidstats') or {},
+        }
+        with self.history_lock:
+            if self.history_run_id != run_id:
+                self.run_history = []
+                self.history_run_id = run_id
+            self.run_history.append(sample)
+            self.last_run_state = sample
 
     def add_observer(self,observer):
-        if self.last_profile:
-            p = {
-                "name": self.last_profile.name,
-                "data": display_profile_data(self.last_profile.data),
-                "type" : "profile"
+        current = self.oven.get_state()
+        with self.history_lock:
+            if self.last_profile:
+                p = {
+                    "name": self.last_profile.name,
+                    "data": display_profile_data(self.last_profile.data),
+                    "type" : "profile"
+                }
+            else:
+                p = None
+            # After completion Oven.reset() clears its timing fields. The
+            # retained last sample remains the authoritative chart context.
+            context = current if current.get('run_start_time') else self.last_run_state
+            context = context or current
+            backlog = {
+                'type': "backlog",
+                'profile': p,
+                'run_start_time': context.get('run_start_time'),
+                'initial_runtime': context.get('initial_runtime', 0),
+                'run_id': context.get('run_id'),
+                'runtime': context.get('runtime'),
+                'clock_time': context.get('clock_time'),
+                'history': list(self.run_history),
             }
-        else:
-            p = None
-        
-        backlog = {
-            'type': "backlog",
-            'profile': p,
-            'run_started': self.started.timestamp() if self.started else None,
-        }
         backlog_json = json.dumps(backlog)
         try:
             observer.send(backlog_json)

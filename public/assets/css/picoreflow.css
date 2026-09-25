@@ -404,6 +404,50 @@ body {
     height: clamp(260px, 48vh, 460px);
 }
 
+.overview-chart-heading {
+    margin: 12px 2px 4px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+}
+
+.overview-clock-graph {
+    height: clamp(240px, 42vh, 400px);
+}
+
+.overview-chart-legend {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-left: 12px;
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+}
+
+.overview-chart-legend i {
+    display: inline-block;
+    width: 18px;
+    margin-right: 4px;
+    border-top: 2px solid currentColor;
+    vertical-align: middle;
+}
+.legend-temperature { color: #fff; }
+.legend-ideal { color: #9cb310; }
+.legend-shifted { color: #6ec6ff; }
+
+html.light .legend-temperature { color: #4a4640; }
+
+@media (max-width: 575.98px) {
+    .overview-chart-legend {
+        display: flex;
+        margin: 4px 0 0;
+    }
+}
+
 .panel-footer {
     background: var(--panel-heading-bg);
     border-radius: 0 0 10px 10px;

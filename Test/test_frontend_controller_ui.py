@@ -44,8 +44,9 @@ def js():
     context.eval(extract_function(src, 'profileDescription'))
     context.eval(extract_function(src, 'toggleSimBadge'))
     context.eval(extract_function(src, 'updateOverviewStatus'))
-    context.eval(extract_function(src, 'clear_persisted_all'))
-    context.eval(extract_function(src, 'prune_persisted_all'))
+    context.eval(extract_function(src, 'clear_run_history'))
+    context.eval(extract_function(src, 'is_current_server_run'))
+    context.eval(extract_function(src, 'apply_run_history'))
     context.eval(extract_function(src, 'apiGet'))
     context.eval(extract_function(src, 'loadRemoteProfiles'))
     context.eval(extract_function(src, 'populateShareCategories'))
@@ -66,6 +67,44 @@ def js():
     context.eval(extract_function(src, 'renderScheduleAfterList'))
     context.eval('var SCHEDULE_CHAIN_BUFFER = 60;')
     return context
+
+
+def test_new_run_clear_removes_in_memory_chart_rows(js):
+    js.eval('''
+        var graph = { live: { data: [[0, 80]] } };
+        var all = [{ time: 1000 }];
+        var clock_chart_status = { run_start_time: 1000 };
+        var detailsInited = false;
+        clear_run_history();
+    ''')
+    assert js.eval('all.length') == 0
+    assert js.eval('graph.live.data.length') == 0
+    assert js.eval('clock_chart_status === null')
+
+
+def test_run_identity_uses_stable_server_run_id(js):
+    js.eval('server_run_id = 7; run_start_time = 1000;')
+    assert js.eval('is_current_server_run({ run_id: 7, run_start_time: 1000.25 })')
+    assert not js.eval('is_current_server_run({ run_id: 8, run_start_time: 1000 })')
+
+
+def test_server_history_rebuilds_both_chart_inputs(js):
+    js.eval('''
+        var all = [];
+        var graph = { live: { data: [] } };
+        function unix_to_yymmdd_hhmmss(v) { return "T" + v; }
+        function syncChartData() {}
+        function updateAxis() {}
+        apply_run_history([{
+            runtime: 12, temperature: 210, catching_up: true, temp_errors: 0,
+            pidstats: { time: 1012, ispoint: 210, setpoint: 220, err: -10, out: 0.5 }
+        }]);
+    ''')
+    assert json.loads(js.eval('JSON.stringify(graph.live.data)')) == [[12, 210]]
+    assert js.eval('all[0].datetime') == 'T1012'
+    assert js.eval('all[0].err') == 10
+    assert js.eval('all[0].out') == 50
+    assert js.eval('all[0].catchingup') == 210
 ########################################################################
 # websocket auto-reconnect
 ########################################################################
@@ -321,46 +360,13 @@ def test_config_socket_updates_sim_badge():
 
 
 ########################################################################
-# persisted details pruning
+# server-backed run history
 ########################################################################
 
-def test_prune_persisted_all_drops_entries_older_than_cutoff(js):
-    js.eval('var STORAGE_KEY = "kiln-controller-all";')
-    js.eval('all = [{ time: 100, v: 1 }, { time: 200, v: 2 }, { time: 300, v: 3 }];')
-    js.eval('var stored = null;')
-    js.eval('localStorage = { setItem: function(k, v) { stored = v; }, removeItem: function(k) {} };')
-    js.eval('save_timer = null;')
-    js.eval('detailsInited = false;')
-    js.eval('function drawall(d) {}')
-    js.eval('function windowed_data() { return all; }')
-    js.eval('prune_persisted_all(200);')
-    assert js.eval('all.length') == 2
-    assert js.eval('all[0].time') == 200
-    assert js.eval('all[1].time') == 300
-    assert js.eval('JSON.parse(stored).length') == 2
-
-
-def test_prune_persisted_all_keeps_exact_cutoff(js):
-    js.eval('var STORAGE_KEY = "kiln-controller-all";')
-    js.eval('all = [{ time: 200, v: 1 }];')
-    js.eval('var stored = null;')
-    js.eval('localStorage = { setItem: function(k, v) { stored = v; }, removeItem: function(k) {} };')
-    js.eval('save_timer = null;')
-    js.eval('detailsInited = false;')
-    js.eval('function drawall(d) {}')
-    js.eval('function windowed_data() { return all; }')
-    js.eval('prune_persisted_all(200);')
-    assert js.eval('all.length') == 1
-
-
-def test_backlog_prunes_stale_details():
+def test_frontend_does_not_persist_run_history():
     src = open(JS_PATH).read()
-    # a client connecting into a firing that started while it was away must
-    # drop persisted details older than the run start time
-    assert 'prune_persisted_all(x.run_started)' in src
-    # ...but a page that stays open and already knows the run must not
-    # prune its live data
-    assert 'adopting_run' in src
+    assert 'kiln-controller-all' not in src
+    assert 'kiln-controller-last-run' not in src
 
 
 ########################################################################

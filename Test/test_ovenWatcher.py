@@ -19,6 +19,9 @@ class FakeOven:
             'temperature': 100,
             'target': 200,
             'runtime': 60,
+            'run_start_time': 1234.5 if self.state == 'RUNNING' else None,
+            'initial_runtime': 0,
+            'run_id': 1,
         }
 
 
@@ -29,6 +32,10 @@ def make_watcher(state="IDLE"):
     watcher.last_profile = None
     watcher.started = None
     watcher.observers = []
+    watcher.run_history = []
+    watcher.history_run_id = None
+    watcher.last_run_state = None
+    watcher.history_lock = threading.Lock()
     watcher.mqtt = None
     watcher.daemon = True
     watcher.oven = FakeOven(state)
@@ -87,25 +94,65 @@ def test_backlog_profile_data_c_scale(monkeypatch):
     assert payload['profile']['data'] == [[0, 200]]  # celsius stays as-is
 
 
-def test_backlog_includes_run_started():
-    watcher = make_watcher()
+def test_backlog_includes_run_start_time():
+    watcher = make_watcher(state="RUNNING")
     profile = types.SimpleNamespace(name="test-fast", data=[[0, 200]])
     watcher.record(profile)
     sock = FakeSocket()
     watcher.add_observer(sock)
     payload = json.loads(sock.sent[0])
-    assert payload['run_started'] == watcher.started.timestamp()
+    assert payload['run_start_time'] == watcher.started.timestamp()
 
 
-def test_backlog_run_started_null_when_idle():
+def test_backlog_run_start_time_null_when_idle():
     watcher = make_watcher()
     sock = FakeSocket()
     watcher.add_observer(sock)
     payload = json.loads(sock.sent[0])
-    assert payload['run_started'] is None
+    assert payload['run_start_time'] is None
+    assert payload['initial_runtime'] == 0
+    assert payload['run_id'] == 1
 
 
-def test_run_loop_stamps_run_started(monkeypatch):
+def test_backlog_includes_stable_oven_timing_metadata():
+    watcher = make_watcher(state="RUNNING")
+    timing = {
+        'run_start_time': watcher.started.timestamp(),
+        'initial_runtime': 600,
+        'run_id': 4,
+    }
+    watcher.oven.get_state = lambda: dict(
+        state='RUNNING', temperature=100, target=200, runtime=620, **timing)
+    sock = FakeSocket()
+    watcher.add_observer(sock)
+    payload = json.loads(sock.sent[0])
+    for key, value in timing.items():
+        assert payload[key] == value
+
+
+def test_backlog_replays_latest_run_to_a_new_client():
+    watcher = make_watcher()
+    profile = types.SimpleNamespace(name="test-fast", data=[[0, 200]])
+    watcher.record(profile)
+    watcher.record_state({
+        'run_start_time': 1000, 'initial_runtime': 0, 'run_id': 4,
+        'runtime': 12, 'temperature': 210, 'clock_time': 1012,
+        'catching_up': False, 'temp_errors': 0,
+        'pidstats': {'time': 1012, 'ispoint': 210, 'setpoint': 220},
+    })
+    watcher.oven.state = 'IDLE'
+    sock = FakeSocket()
+    watcher.add_observer(sock)
+    payload = json.loads(sock.sent[0])
+    assert payload['run_start_time'] == 1000
+    assert payload['run_id'] == 4
+    assert payload['runtime'] == 12
+    assert payload['clock_time'] == 1012
+    assert payload['history'][0]['runtime'] == 12
+    assert payload['history'][0]['pidstats']['setpoint'] == 220
+
+
+def test_run_loop_publishes_oven_run_start_time(monkeypatch):
     watcher = make_watcher(state="RUNNING")
     profile = types.SimpleNamespace(name="test-fast", data=[[0, 200]])
     watcher.record(profile)
@@ -125,7 +172,45 @@ def test_run_loop_stamps_run_started(monkeypatch):
         watcher.run()
 
     payload = json.loads(sock.sent[0])
-    assert payload['run_started'] == watcher.started.timestamp()
+    assert payload['run_start_time'] == 1234.5
+
+
+def test_run_loop_does_not_overwrite_oven_run_start_time(monkeypatch):
+    watcher = make_watcher(state="RUNNING")
+    watcher.record(types.SimpleNamespace(name="test-fast", data=[[0, 200]]))
+    watcher.oven.get_state = lambda: {
+        'state': 'RUNNING', 'temperature': 100, 'target': 200,
+        'runtime': 60, 'run_start_time': 1234.5,
+    }
+    sock = FakeSocket()
+    watcher.observers.append(sock)
+    sleeps = [0]
+
+    def fake_sleep(secs):
+        sleeps[0] += 1
+        if sleeps[0] >= 2:
+            raise StopIteration
+
+    monkeypatch.setattr(ovenWatcher.time, 'sleep', fake_sleep)
+    with pytest.raises(StopIteration):
+        watcher.run()
+    assert json.loads(sock.sent[0])['run_start_time'] == 1234.5
+
+
+def test_run_loop_preserves_explicit_idle_run_start_time_null(monkeypatch):
+    watcher = make_watcher(state="IDLE")
+    watcher.record(types.SimpleNamespace(name="test-fast", data=[[0, 200]]))
+    watcher.oven.get_state = lambda: {
+        'state': 'IDLE', 'temperature': 100, 'target': 0,
+        'runtime': 0, 'run_start_time': None,
+    }
+    sock = FakeSocket()
+    watcher.observers.append(sock)
+
+    monkeypatch.setattr(ovenWatcher.time, 'sleep', lambda secs: (_ for _ in ()).throw(StopIteration))
+    with pytest.raises(StopIteration):
+        watcher.run()
+    assert json.loads(sock.sent[0])['run_start_time'] is None
 
 
 def test_add_observer_no_profile():
@@ -229,7 +314,7 @@ def test_run_loop_publishes_to_mqtt_when_enabled(monkeypatch):
 
     assert len(mqtt.published) == 2
     assert mqtt.published[0]['state'] == 'RUNNING'
-    assert mqtt.published[0]['run_started'] == watcher.started.timestamp()
+    assert mqtt.published[0]['run_start_time'] == 1234.5
 
 
 def test_run_loop_skips_mqtt_when_disabled(monkeypatch):

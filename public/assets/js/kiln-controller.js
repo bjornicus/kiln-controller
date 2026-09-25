@@ -1,6 +1,7 @@
 var state = "IDLE";
 var state_last = "";
-var run_started = null;
+var run_start_time = null;
+var server_run_id = null;
 var running_profile_name = null;
 var running_profile_name_last = null;
 var backlog_profile_name = null;
@@ -28,73 +29,54 @@ var PROFILE_DS = 0;
 var LIVE_DS = 1;
 
 var chart = null;
+var clock_chart = null;
+var clock_chart_run = null;
+var clock_chart_status = null;
 
 // tuning state
 var all = [];
-var STORAGE_KEY = 'kiln-controller-all';
-try {
-    var saved_all = localStorage.getItem(STORAGE_KEY);
-    if (saved_all) {
-        var parsed_all = JSON.parse(saved_all);
-        if (Array.isArray(parsed_all)) { all = parsed_all; }
-    }
-} catch (e) {
-    all = [];
-}
 var charts = {};
 var detailsInited = false;
 
-var save_timer = null;
-function persist_all() {
-    if (save_timer) { return; }
-    save_timer = setTimeout(function() {
-        save_timer = null;
-        try {
-            var slice = all.length > 6000 ? all.slice(-6000) : all;
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(slice));
-        } catch (e) {}
-    }, 2000);
-}
-function flush_all() {
-    if (save_timer) {
-        clearTimeout(save_timer);
-        save_timer = null;
-    }
-    try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(all.slice(-6000)));
-    } catch (e) {}
-}
-function clear_persisted_all() {
+function clear_run_history() {
     all = [];
-    if (save_timer) {
-        clearTimeout(save_timer);
-        save_timer = null;
-    }
-    try {
-        localStorage.removeItem(STORAGE_KEY);
-    } catch (e) {}
+    graph.live.data = [];
+    clock_chart_status = null;
     if (detailsInited) {
         drawall(windowed_data());
     }
 }
-function prune_persisted_all(cutoff) {
-    // keep only details recorded at or after the run start time, so a page
-    // that loads (or reconnects) mid-firing never shows artifacts from an
-    // earlier firing. entries are dropped from memory and localStorage but
-    // the current run's data is preserved.
-    all = all.filter(function(d) { return d.time >= cutoff; });
-    if (save_timer) {
-        clearTimeout(save_timer);
-        save_timer = null;
+function is_current_server_run(status) {
+    if (!status || !status.run_start_time) { return false; }
+    if (server_run_id !== undefined && server_run_id !== null &&
+            status.run_id !== undefined && status.run_id !== null) {
+        return String(server_run_id) === String(status.run_id);
     }
-    try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(all.slice(-6000)));
-    } catch (e) {}
-    if (detailsInited) {
-        drawall(windowed_data());
-    }
+    return Number(run_start_time) === Number(status.run_start_time);
 }
-window.addEventListener('pagehide', flush_all);
+function apply_run_history(history) {
+    if (!Array.isArray(history)) { return; }
+    all = [];
+    graph.live.data = [];
+    history.forEach(function(sample) {
+        if (sample.runtime !== undefined && sample.temperature !== undefined) {
+            graph.live.data.push([sample.runtime, sample.temperature]);
+        }
+        var pid = sample.pidstats;
+        if (!pid || !pid.time) { return; }
+        // History is JSON data, so it is safe to decorate its own copy just
+        // as the live websocket path decorates an incoming PID sample.
+        pid.datetime = unix_to_yymmdd_hhmmss(pid.time);
+        pid.err = pid.err * -1;
+        pid.out = pid.out * 100;
+        pid.catching_up = sample.catching_up;
+        pid.temp_errors = sample.temp_errors;
+        if (sample.catching_up === true) { pid.catchingup = pid.ispoint; }
+        all.push(pid);
+    });
+    syncChartData();
+    updateAxis();
+}
 
 var TABS = ['overview', 'details', 'profiles', 'config'];
 
@@ -249,6 +231,7 @@ function showTab(name) {
         loadAlerts();
     } else if (name === 'overview' && chart) {
         chart.resize();
+        if (clock_chart) { clock_chart.resize(); }
     }
 }
 
@@ -321,6 +304,18 @@ function applyChartTheme() {
         chart.options.scales.x.grid.color = tc.grid;
         chart.options.scales.y.grid.color = tc.grid;
         chart.update('none');
+    }
+    if (clock_chart) {
+        clock_chart.options.scales.x.ticks.color = tc.axis;
+        clock_chart.options.scales.y.ticks.color = tc.axis;
+        clock_chart.options.scales.x.grid.color = tc.grid;
+        clock_chart.options.scales.y.grid.color = tc.grid;
+        clock_chart.data.datasets[0].borderColor = tc.live;
+        clock_chart.data.datasets[0].backgroundColor = tc.live;
+        if (clock_chart.options.plugins.legend && clock_chart.options.plugins.legend.labels) {
+            clock_chart.options.plugins.legend.labels.color = tc.axis;
+        }
+        clock_chart.update('none');
     }
     for (var k in charts) {
         if (charts.hasOwnProperty(k) && charts[k]) {
@@ -439,6 +434,89 @@ function syncChartData() {
     chart.update('none');
 }
 
+function clockOverviewTick(val) {
+    return formatDuration(Number(val));
+}
+
+function createClockChart() {
+    var tc = themeColors();
+    clock_chart = new Chart($('clock_graph_canvas'), {
+        type: 'line',
+        data: { datasets: [
+            { label: 'Temperature', data: [], order: 1, borderColor: tc.live, backgroundColor: tc.live,
+              borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: true },
+            { label: 'Ideal schedule', data: [], order: 3, borderColor: '#9cb310', backgroundColor: '#9cb310',
+              borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: true },
+            { label: 'Shifted schedule', data: [], order: 2, borderColor: '#6ec6ff', backgroundColor: '#6ec6ff',
+              borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: true }
+        ] },
+        options: {
+            responsive: true, maintainAspectRatio: false, animation: false,
+            interaction: { mode: 'nearest', intersect: false },
+            plugins: {
+                legend: { display: false },
+                tooltip: { enabled: true, callbacks: {
+                    title: function(items) { return items.length ? formatDuration(items[0].parsed.x) : ''; }
+                } }, dragData: false
+            },
+            scales: {
+                x: { type: 'linear', ticks: { maxTicksLimit: 8, maxRotation: 0,
+                    callback: clockOverviewTick, color: tc.axis }, grid: { color: tc.grid } },
+                y: { ticks: { color: tc.axis }, grid: { color: tc.grid } }
+            }
+        }
+    });
+}
+
+function updateClockChart(status) {
+    if (!clock_chart) { return; }
+    status = status || {};
+    var hasRunField = Object.prototype.hasOwnProperty.call(status, 'run_start_time');
+    var run = hasRunField ? status.run_start_time : run_start_time;
+    if (!run) {
+        // Match the profile-time chart: stopping a firing must not erase the
+        // plot.  Retain the last active status because idle states reset the
+        // oven's runtime and timing metadata.
+        if (!clock_chart_status) { return; }
+        status = clock_chart_status;
+        run = status.run_start_time;
+    } else {
+        clock_chart_status = {
+            run_start_time: run,
+            initial_runtime: status.initial_runtime,
+            runtime: status.runtime,
+            time: status.clock_time !== undefined ? status.clock_time : status.time
+        };
+    }
+    var profile = graph.profile.data || [];
+    var rows = all.slice();
+    var latest = rows.length ? clockElapsedSeconds(rows[rows.length - 1], run) :
+        Number(status.time) - Number(run);
+    if (!isFinite(latest)) { latest = Number(status.clock_time) - Number(run); }
+    var initial = status.initial_runtime;
+    if (initial === undefined || initial === null) { initial = 0; }
+    var current = status.runtime;
+    if (current === undefined || current === null) { current = initial; }
+    var series = buildClockTimeSeries({ samples: rows, profile: profile,
+        run_start_time: run, initial_runtime: initial,
+        latest_elapsed: latest, current_runtime: current
+    });
+    clock_chart.data.datasets[0].data = series.measured;
+    clock_chart.data.datasets[1].data = series.ideal;
+    clock_chart.data.datasets[2].data = series.shifted;
+    clock_chart_run = run;
+    var points = series.measured.concat(series.ideal, series.shifted);
+    if (points.length) {
+        var min = points[0].x, max = points[0].x, ymax = 0;
+        points.forEach(function(p) { min = Math.min(min, p.x); max = Math.max(max, p.x); ymax = Math.max(ymax, p.y); });
+        clock_chart.options.scales.x.min = min;
+        clock_chart.options.scales.x.max = max > min ? max : min + 60;
+        clock_chart.options.scales.y.min = 0;
+        clock_chart.options.scales.y.max = ymax > 0 ? Math.ceil(ymax / 25) * 25 : 100;
+    }
+    clock_chart.update('none');
+}
+
 function axisStep(max) {
     if (max > 3600) { return 3600; }
     if (max > 360) { return 120; }
@@ -514,7 +592,8 @@ function setEditMode(on) {
        selected_profile = id;
        selected_profile_name = profiles[id].name;
        graph.profile.data = profiles[id].data;
-       if (state != "RUNNING" && state != "PAUSED") {
+       if (state != "RUNNING" && state != "PAUSED" &&
+               backlog_profile_name !== profiles[id].name) {
            graph.live.data = [];
        }
        syncChartData();
@@ -681,7 +760,7 @@ function runTask()
     syncChartData();
     updateAxis();
 
-    clear_persisted_all();
+    clear_run_history();
 
     ws_control.send(JSON.stringify(cmd));
 
@@ -1841,6 +1920,123 @@ function set_chart_data(chart, rows, key) {
 // current slope
 var RATE_MAX_GAP = 15;
 
+/*
+ * Elapsed clock-time chart series helpers.  PID history supplies `time`,
+ * `ispoint`, and `setpoint` in the same clock domain as `run_start_time`.
+ * Subtracting the immutable run start produces elapsed clock seconds.
+ */
+function clockSampleTime(sample) {
+  if (!sample || sample.time === undefined || sample.time === null) { return null; }
+  var value = Number(sample.time);
+  return isFinite(value) ? value : null;
+}
+
+function clockElapsedSeconds(sample, runStartTime) {
+  var sampleTime = clockSampleTime(sample);
+  var started = Number(runStartTime);
+  if (sampleTime === null || !isFinite(started)) { return null; }
+  return Math.max(0, sampleTime - started);
+}
+
+function clockUniqueSamples(samples) {
+  var byTime = {};
+  var order = [];
+  samples = Array.isArray(samples) ? samples : [];
+  for (var i = 0; i < samples.length; i++) {
+    var sample = samples[i];
+    var sampleTime = clockSampleTime(sample);
+    if (sampleTime === null) { continue; }
+    var key = String(sampleTime);
+    if (!Object.prototype.hasOwnProperty.call(byTime, key)) { order.push(key); }
+    // Last status/PID update wins when a backlog and live update overlap.
+    byTime[key] = sample;
+  }
+  order.sort(function(a, b) { return Number(a) - Number(b); });
+  var out = [];
+  for (var j = 0; j < order.length; j++) { out.push(byTime[order[j]]); }
+  return out;
+}
+
+function clockMeasuredSeries(samples, runStartTime) {
+  var rows = clockUniqueSamples(samples), out = [];
+  for (var i = 0; i < rows.length; i++) {
+    var value = rows[i].ispoint;
+    if (value === undefined || value === null) { continue; }
+    out.push({ x: clockElapsedSeconds(rows[i], runStartTime), y: Number(value) });
+  }
+  return out;
+}
+
+function clockProfileValue(profile, runtime) {
+  if (!profile || !profile.length) { return null; }
+  runtime = Number(runtime);
+  if (runtime <= Number(profile[0][0])) { return Number(profile[0][1]); }
+  for (var i = 1; i < profile.length; i++) {
+    var before = profile[i - 1], after = profile[i];
+    if (runtime <= Number(after[0])) {
+      var span = Number(after[0]) - Number(before[0]);
+      if (!span) { return Number(after[1]); }
+      return Number(before[1]) + (Number(after[1]) - Number(before[1])) *
+        (runtime - Number(before[0])) / span;
+    }
+  }
+  return Number(profile[profile.length - 1][1]);
+}
+
+function clockIdealSeries(profile, initialRuntime) {
+  var out = [], offset = Number(initialRuntime || 0);
+  if (!Array.isArray(profile) || !profile.length) { return out; }
+  var first = Number(profile[0][0]);
+  if (offset < first) { offset = first; }
+  out.push({ x: 0, y: clockProfileValue(profile, offset) });
+  for (var i = 0; i < profile.length; i++) {
+    var runtime = Number(profile[i][0]);
+    if (runtime > offset) {
+      out.push({ x: runtime - offset, y: Number(profile[i][1]) });
+    }
+  }
+  return out;
+}
+
+function clockShiftedHistorySeries(samples, runStartTime) {
+  var rows = clockUniqueSamples(samples), out = [];
+  for (var i = 0; i < rows.length; i++) {
+    var value = rows[i].setpoint;
+    if (value === undefined || value === null) { continue; }
+    out.push({ x: clockElapsedSeconds(rows[i], runStartTime), y: Number(value) });
+  }
+  return out;
+}
+
+function clockShiftedFutureSeries(profile, latestElapsed, currentRuntime) {
+  var out = [], elapsed = Number(latestElapsed), runtime = Number(currentRuntime);
+  if (!Array.isArray(profile) || !profile.length || !isFinite(elapsed) || !isFinite(runtime)) { return out; }
+  out.push({ x: elapsed, y: clockProfileValue(profile, runtime) });
+  for (var i = 0; i < profile.length; i++) {
+    var pointRuntime = Number(profile[i][0]);
+    if (pointRuntime > runtime) {
+      out.push({ x: elapsed + pointRuntime - runtime, y: Number(profile[i][1]) });
+    }
+  }
+  return out;
+}
+
+function buildClockTimeSeries(options) {
+  options = options || {};
+  var samples = options.samples || [];
+  var history = clockShiftedHistorySeries(samples, options.run_start_time);
+  var measured = clockMeasuredSeries(samples, options.run_start_time);
+  var future = clockShiftedFutureSeries(options.profile, options.latest_elapsed,
+                                        options.current_runtime);
+  return {
+    measured: measured,
+    ideal: clockIdealSeries(options.profile, options.initial_runtime),
+    shifted_history: history,
+    shifted_future: future,
+    shifted: history.concat(future)
+  };
+}
+
 function rate_series(data, field) {
   var out = [];
   var i;
@@ -1985,6 +2181,7 @@ function init()
     }
 
     createChart();
+    createClockChart();
 
     var icon = $('theme_icon');
     if (icon) {
@@ -2058,44 +2255,51 @@ function init()
 
         if (x.type == "backlog")
         {
-            // the backlog is the first message sent to a new client, so it
-            // identifies the run already in progress. adopt it without
-            // clearing stored data, so a page refresh mid-run is not lost.
-            var adopting_run = x.run_started && x.run_started !== run_started;
-            run_started = x.run_started || null;
-
-            if (!x.run_started)
-            {
-                // the server has no run in progress, so any stored details
-                // belong to a previous firing. wipe them.
-                clear_persisted_all();
-            }
-            else if (adopting_run)
-            {
-                // this client connected (or reconnected) into a firing that
-                // started while it was away. drop stored details older than
-                // the run start so the details page never shows artifacts
-                // from an earlier firing.
-                prune_persisted_all(x.run_started);
-            }
-
+            // The backlog is the first message sent to a new client. It
+            // contains the controller's retained run, so it is safe to
+            // replace any in-memory chart rows on every reconnect.
+            // A backlog is also sent after an ordinary reconnect. Never let
+            // that handshake erase samples; the following live status can
+            // authoritatively identify and begin a different run.
             if (x.profile)
             {
                 backlog_profile_name = typeof x.profile == 'object' ? x.profile.name : x.profile;
+                if (typeof x.profile == 'object' && Array.isArray(x.profile.data)) {
+                    graph.profile.data = x.profile.data;
+                    selected_profile_name = x.profile.name || selected_profile_name;
+                }
                 adoptProfile(backlog_profile_name);
+            }
+            if (Array.isArray(x.history)) {
+                // Server history is authoritative. It lets a completely new
+                // browser reconstruct the firing rather than inheriting the
+                // limited cache of whichever browser happened to start it.
+                apply_run_history(x.history);
+                // Mark this server-supplied run as adopted before the next
+                // live status arrives. Otherwise a brand-new browser would
+                // mistake that status for a new run and clear the replay it
+                // has just received.
+                if (x.run_start_time) {
+                    run_start_time = x.run_start_time;
+                    server_run_id = x.run_id;
+                }
             }
         }
 
-        // a new run_started means a fresh firing has begun, no matter
+        // a new run_start_time means a fresh firing has begun, no matter
         // how it was started (start button, scheduled run, api command,
         // automatic restart). wipe the stored details data and load the
         // reported profile so the main page reflects the actual run.
-        if (x.run_started && x.run_started !== run_started) {
-            run_started = x.run_started;
-            clear_persisted_all();
+        if (x.type != "backlog" && x.run_start_time && !is_current_server_run(x)) {
+            clear_run_history();
+            run_start_time = x.run_start_time;
+            server_run_id = x.run_id;
             if (x.profile) {
                 adoptProfile(typeof x.profile == 'object' ? x.profile.name : x.profile);
             }
+        } else if (x.run_start_time) {
+            run_start_time = x.run_start_time;
+            server_run_id = x.run_id;
         }
 
         // track which schedule is running so the Saved Schedules list
@@ -2103,7 +2307,6 @@ function init()
         running_profile_name = (x.state == "RUNNING" || x.state == "PAUSED") ? (x.profile || null) : null;
         if (running_profile_name !== running_profile_name_last) {
             running_profile_name_last = running_profile_name;
-            if (!running_profile_name) { backlog_profile_name = null; }
             renderProfiles();
         }
 
@@ -2134,6 +2337,7 @@ function init()
                 $('eta').innerHTML = eta;
                 $('elapsed').innerHTML = elapsed;
             }
+
             else
             {
                 updateSelectedProfileLabel();
@@ -2141,12 +2345,14 @@ function init()
                 $('elapsed').innerHTML = '--:--:--';
             }
 
+            updateClockChart(x);
+
             state_last = state;
 
         }
 
         // tuning feed
-        if (x.pidstats && x.pidstats.time) {
+        if (x.run_start_time && x.pidstats && x.pidstats.time) {
             x.pidstats["datetime"] = unix_to_yymmdd_hhmmss(x.pidstats.time);
             x.pidstats.err = x.pidstats.err * -1;
             x.pidstats.out = x.pidstats.out * 100;
@@ -2156,7 +2362,11 @@ function init()
                 x.pidstats.catchingup = x.pidstats.ispoint;
             }
             all.push(x.pidstats);
-            persist_all();
+
+            // PID history is clock-domain keyed and also reconstructs the clock
+            // chart after a backlog/reconnect.  The live status supplies the
+            // current runtime and canonical run timing metadata.
+            updateClockChart(x);
 
             if (detailsInited) {
                 drawall(windowed_data());

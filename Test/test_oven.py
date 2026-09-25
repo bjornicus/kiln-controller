@@ -12,10 +12,12 @@ from lib.oven import (
     Duplogger,
     Max31855_Error,
     Max31856_Error,
+    Clock,
     Oven,
     PID,
     Profile,
     SimulatedOven,
+    SimulatedClock,
     TempSensorReal,
     TempTracker,
     ThermocoupleTracker,
@@ -330,6 +332,72 @@ def test_run_profile_no_seek_start_time_matches_startat(no_auto_restarts):
     oven.update_target_temp()
     assert oven.target == pytest.approx(200.0)
 
+
+def test_run_metadata_preserves_initial_runtime_and_startat(no_auto_restarts,
+                                                            monkeypatch):
+    clock = {'now': 1000.0}
+    monkeypatch.setattr(oven_module().time, 'time', lambda: clock['now'])
+    oven = Oven()
+    oven.board = FakeBoard(250)
+    oven.run_profile(get_profile(), startat=10, allow_seek=False)
+
+    assert oven.run_start_time == 1000.0
+    assert oven.initial_runtime == 600
+    assert oven.get_state()['run_start_time'] == 1000.0
+    assert oven.get_state()['initial_runtime'] == 600
+
+
+def test_schedule_delay_accumulates_without_moving_run_anchor(no_auto_restarts,
+                                                              monkeypatch):
+    clock = {'now': 1000.0}
+    monkeypatch.setattr(oven_module().time, 'time', lambda: clock['now'])
+    oven = Oven()
+    oven.board = FakeBoard(0)
+    oven.run_profile(get_profile(), startat=0, allow_seek=False)
+    anchor = oven.run_start_time
+
+    # Profile advances for 10 seconds, then two independent catch-up events
+    # hold profile time.  Delay is derived from the stable anchor, so earlier
+    # history is not retroactively shifted by the second event.
+    clock['now'] = 1010
+    oven.runtime = 10
+    assert oven.get_schedule_delay() == pytest.approx(0)
+    clock['now'] = 1020
+    assert oven.get_schedule_delay() == pytest.approx(10)
+    oven.runtime = 20
+    clock['now'] = 1030
+    assert oven.get_schedule_delay() == pytest.approx(10)
+    oven.runtime = 30
+    clock['now'] = 1040
+    assert oven.get_schedule_delay() == pytest.approx(10)
+    assert oven.run_start_time == anchor
+
+
+def test_seek_start_is_recorded_as_initial_runtime(no_auto_restarts,
+                                                   monkeypatch):
+    monkeypatch.setattr(config, 'kiln_must_catch_up', False)
+    monkeypatch.setattr(oven_module().time, 'time', lambda: 1000.0)
+    oven = Oven()
+    oven.board = FakeBoard(250)
+    oven.run_profile(get_profile(), startat=0, allow_seek=True)
+    assert oven.initial_runtime == 3800
+    assert oven.get_state()['initial_runtime'] == 3800
+
+
+def test_schedule_delay_uses_the_injected_clock():
+    sim = make_sim()
+    sim.run_start_time = 1000.0
+    sim.initial_runtime = 0
+    sim.runtime = 20
+    sim.clock = types.SimpleNamespace(time=lambda: 1030.0)
+    assert sim.get_schedule_delay() == pytest.approx(10)
+
+
+def test_state_exposes_oven_clock_time_for_simulation():
+    sim = make_sim()
+    sim.clock = types.SimpleNamespace(time=lambda: 1234.5)
+    state = sim.get_state()
+    assert state['clock_time'] == 1234.5
 
 def test_run_sequence_increments_and_run_id_in_status(no_auto_restarts):
     # each firing gets a fresh run_id so a scheduled firing can chain
@@ -739,7 +807,8 @@ def test_automatic_restart(tmp_path, monkeypatch):
 
     state_file = tmp_path / 'state.json'
     state_file.write_text(json.dumps({
-        'state': 'RUNNING', 'runtime': 60, 'profile': 'test-fast', 'cost': 3.5
+        'state': 'RUNNING', 'runtime': 60, 'profile': 'test-fast', 'cost': 3.5,
+        'run_start_time': 1234.5, 'initial_runtime': 0, 'run_id': 7,
     }))
 
     monkeypatch.setattr(config, 'automatic_restart_state_file', str(state_file))
@@ -765,6 +834,9 @@ def test_automatic_restart(tmp_path, monkeypatch):
     assert calls['allow_seek'] is False
     assert calls['profile'].name == 'test-fast'
     assert oven.cost == 3.5
+    assert oven.run_start_time == 1234.5
+    assert oven.initial_runtime == 0
+    assert oven.run_sequence == 7
 
 
 def test_run_unknown_state_does_not_auto_restart(monkeypatch):
@@ -962,6 +1034,7 @@ def make_sim():
     sim.R_ho = 0.1
     sim.R_ho_noair = 0.1
     sim.speedup_factor = 1
+    sim.clock = Clock()
     sim.time_step = config.sensor_time_wait
     sim.temperature = 100.0
     sim.target = 0
@@ -1017,25 +1090,28 @@ def test_sim_heat_then_cool_cooling(monkeypatch):
     assert sim.heat == 0.0
 
 
-def test_sim_get_start_time():
+def test_simulated_clock_accelerates_runtime_clock(monkeypatch):
+    clock = {'epoch': 1000.0}
+    monkeypatch.setattr(oven_module().time, 'time', lambda: clock['epoch'])
     sim = make_sim()
-    sim.speedup_factor = 2
+    sim.clock = SimulatedClock(2)
     sim.runtime = 100
     start = sim.get_start_time()
-    offset = time.time() - start
-    assert offset == pytest.approx(50, abs=1)  # 100 sim-seconds at 2x speedup
+    assert sim.clock.time() - start == pytest.approx(100)
+    clock['epoch'] += 50
+    assert sim.clock.time() == pytest.approx(1100)
 
 
 def test_sim_update_runtime(monkeypatch):
     clock = {'epoch': 1_600_000_000.0}
     monkeypatch.setattr(oven_module().time, 'time', lambda: clock['epoch'])
     sim = make_sim()
-    sim.speedup_factor = 1
-    sim.start_time = clock['epoch'] - 100  # 100s ago
+    sim.clock = SimulatedClock(2)
+    sim.start_time = sim.clock.time() - 100  # 100s ago
     sim.update_runtime()
     assert sim.runtime == 100
 
-    sim.speedup_factor = 2
+    clock['epoch'] += 50
     sim.update_runtime()
     assert sim.runtime == 200
 
@@ -1104,8 +1180,8 @@ def test_sim_runtime_survives_dst(monkeypatch):
     clock = {'epoch': 1_600_000_000.0}
     monkeypatch.setattr(oven_module().time, 'time', lambda: clock['epoch'])
     sim = make_sim()
-    sim.speedup_factor = 2
-    sim.start_time = clock['epoch']
+    sim.clock = SimulatedClock(2)
+    sim.start_time = sim.clock.time()
     clock['epoch'] += 600
     sim.update_runtime()
     assert sim.runtime == pytest.approx(1200)

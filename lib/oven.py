@@ -17,6 +17,26 @@ log = logging.getLogger(__name__)
 END_COMPLETED = 'completed'
 END_STOPPED = 'stopped'
 
+
+class Clock(object):
+    """
+    Real ovens use the default clock which provides the real time
+    """
+    def time(self):
+        return time.time()
+
+
+class SimulatedClock(Clock):
+    """For simulations, provides an accelerated clock time sped up by the sim_speedup factor set in config.py."""
+    def __init__(self, speedup_factor):
+        self.speedup_factor = speedup_factor
+        self.real_anchor = super().time()
+        self.logical_anchor = self.real_anchor
+
+    def time(self):
+        return (self.logical_anchor +
+                (super().time() - self.real_anchor) * self.speedup_factor)
+
 class DupFilter(object):
     def __init__(self):
         self.msgs = set()
@@ -346,9 +366,10 @@ class Max31856(TempSensorReal):
 class Oven(threading.Thread):
     '''parent oven class. this has all the common code
        for either a real or simulated oven'''
-    def __init__(self):
+    def __init__(self, clock=None):
         threading.Thread.__init__(self)
         self.daemon = True
+        self.clock = clock or Clock()
         self.temperature = 0
         self.time_step = config.sensor_time_wait
         self.alert_manager = None
@@ -373,7 +394,14 @@ class Oven(threading.Thread):
         self.cost = 0
         self.state = "IDLE"
         self.profile = None
+        # ``start_time`` is the mutable profile clock: catch-up and pause
+        # handling change it.
         self.start_time = 0
+        # ``run_start_time`` is an immutable anchor in this
+        # oven's clock domain for reconstructing a firing timeline (real wall clock time vs temperature).
+        self.run_start_time = None
+        # ``initial_runtime`` is the profile runtime at the start of a firing. It will be non-zero in cases where the firing starts part way through the profile.
+        self.initial_runtime = 0
         self.runtime = 0
         self.totaltime = 0
         self.target = 0
@@ -381,7 +409,8 @@ class Oven(threading.Thread):
         self.heat_rate = 0
         self.heat_rate_temps = []
         self.emergency_heat_rate_temps = []
-        self.pid = PID(ki=config.pid_ki, kd=config.pid_kd, kp=config.pid_kp)
+        self.pid = PID(ki=config.pid_ki, kd=config.pid_kd, kp=config.pid_kp,
+                       now=datetime.datetime.fromtimestamp(self.clock.time()))
         self.catching_up = False
         # how long the current catch-up stall has lasted (see
         # check_catch_up_stalled); reset ends any measured episode
@@ -428,6 +457,8 @@ class Oven(threading.Thread):
         self.reset()
         self.startat = startat * 60
         self.runtime = runtime
+        self.run_start_time = self.clock.time()
+        self.initial_runtime = runtime
         # derive start_time from the (possibly seek-adjusted) runtime so
         # update_runtime() preserves it instead of resetting to zero
         self.start_time = self.get_start_time()
@@ -490,7 +521,16 @@ class Oven(threading.Thread):
     def get_start_time(self):
         # epoch seconds so elapsed-time math is immune to local-time
         # (daylight-saving) changes while a firing is running
-        return time.time() - self.runtime
+        return self.clock.time() - self.runtime
+
+    def get_schedule_delay(self):
+        '''Return profile seconds delayed relative to the original programmed schedule.
+        '''
+        if self.run_start_time is None:
+            return 0
+        elapsed_profile = max(0, self.clock.time() - self.run_start_time)
+        progressed = max(0, self.runtime - self.initial_runtime)
+        return max(0, elapsed_profile - progressed)
 
     def kiln_must_catch_up(self):
         '''shift the whole schedule forward in time by one time_step
@@ -515,7 +555,7 @@ class Oven(threading.Thread):
 
     def update_runtime(self):
 
-        runtime_delta = time.time() - self.start_time
+        runtime_delta = self.clock.time() - self.start_time
         if runtime_delta < 0:
             runtime_delta = 0
 
@@ -651,7 +691,7 @@ class Oven(threading.Thread):
             self.relay_off_temps = []
             return
 
-        now = time.time()
+        now = self.clock.time()
         window = config.relay_stuck_on_window * 60
         self.relay_off_temps.append((now, temp))
         self.relay_off_temps = [(t, x) for (t, x) in self.relay_off_temps
@@ -675,10 +715,10 @@ class Oven(threading.Thread):
             self.catch_up_alerted = False
             return
         if self.catch_up_since is None:
-            self.catch_up_since = time.time()
+            self.catch_up_since = self.clock.time()
             return
         if not self.catch_up_alerted and \
-                time.time() - self.catch_up_since >= config.catch_up_stalled_minutes * 60:
+                self.clock.time() - self.catch_up_since >= config.catch_up_stalled_minutes * 60:
             self.catch_up_alerted = True
             self._emit('catch_up_stalled',
                        minutes=config.catch_up_stalled_minutes,
@@ -761,8 +801,11 @@ class Oven(threading.Thread):
             'profile': self.profile.name if self.profile else None,
             'run_id': self.run_sequence,
             'pidstats': self.get_display_pidstats(),
+            'clock_time': self.clock.time(),
             'catching_up': self.catching_up,
             'temp_errors': temp_errors,
+            'run_start_time': self.run_start_time,
+            'initial_runtime': self.initial_runtime if self.run_start_time is not None else 0,
         }
         return state
 
@@ -798,6 +841,10 @@ class Oven(threading.Thread):
         # only automatic restart if the feature is enabled
         if not config.automatic_restarts == True:
             return False
+        if (isinstance(self.clock, SimulatedClock) and
+                self.clock.speedup_factor > 1):
+            duplog.info("automatic restart is not supported for accelerated simulations")
+            return False
         if self.state_file_is_old():
             duplog.info("automatic restart not possible. state file does not exist or is too old.")
             return False
@@ -820,6 +867,8 @@ class Oven(threading.Thread):
             profile_json = json.dumps(json.load(infile))
         profile = Profile(profile_json)
         self.run_profile(profile, startat=startat, allow_seek=False)  # We don't want a seek on an auto restart.
+        self.run_start_time = d["run_start_time"]
+        self.initial_runtime = d["initial_runtime"]
         self.cost = d["cost"]
         time.sleep(1)
         self.ovenwatcher.record(profile)
@@ -931,24 +980,13 @@ class SimulatedOven(Oven):
         self.t = self.t_env  # deg C temp of oven (internal)
         self.t_h = self.t_env # deg C temp of heating element
 
-        super().__init__()
+        super().__init__(clock=SimulatedClock(self.speedup_factor))
 
         self.start_time = self.get_start_time();
 
         # start thread
         self.start()
         log.info("SimulatedOven started")
-
-    # runtime is in sped up time, start_time is epoch seconds (real time)
-    def get_start_time(self):
-        return time.time() - self.runtime / self.speedup_factor
-
-    def update_runtime(self):
-        runtime_delta = (time.time() - self.start_time) * self.speedup_factor
-        if runtime_delta < 0:
-            runtime_delta = 0
-
-        self.runtime = runtime_delta
 
     def update_target_temp(self):
         self.target = self.profile.get_target_temperature(self.runtime)
@@ -976,7 +1014,7 @@ class SimulatedOven(Oven):
         self.board.temp_sensor.simulated_temperature = self.t
 
     def heat_then_cool(self):
-        now_simulator = datetime.datetime.fromtimestamp(self.start_time + self.runtime)
+        now_simulator = datetime.datetime.fromtimestamp(self.clock.time())
         pid = self.pid.compute(self.target,
                                self.board.temp_sensor.temperature() +
                                delta_to_c(config.thermocouple_offset), now_simulator)
@@ -1043,7 +1081,8 @@ class RealOven(Oven):
     def heat_then_cool(self):
         pid = self.pid.compute(self.target,
                                self.board.temp_sensor.temperature() +
-                               delta_to_c(config.thermocouple_offset), datetime.datetime.now())
+                               delta_to_c(config.thermocouple_offset),
+                               datetime.datetime.fromtimestamp(self.clock.time()))
 
         heat_on = float(self.time_step * pid)
         heat_off = float(self.time_step * (1 - pid))
@@ -1152,11 +1191,11 @@ class Profile():
 
 class PID():
 
-    def __init__(self, ki=1, kp=1, kd=1):
+    def __init__(self, ki=1, kp=1, kd=1, now=None):
         self.ki = ki
         self.kp = kp
         self.kd = kd
-        self.lastNow = datetime.datetime.now()
+        self.lastNow = now or datetime.datetime.now()
         self.iterm = 0
         self.lastErr = 0
         self.pidstats = {}

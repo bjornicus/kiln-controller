@@ -146,13 +146,13 @@ def test_overview_has_elapsed_display():
     assert "$('elapsed').innerHTML = '--:--:--';" in src
 
 
-def test_backlog_clears_storage_when_idle():
-    # when the server reports no run in progress on connect, the client
-    # must wipe stored details data left over from a previous firing
+def test_idle_backlog_retains_last_run_storage():
+    # An idle reconnect/refresh receives the last run from the server.
     src = open(JS_PATH).read()
-    m = re.search(r'if \(!x\.run_started\)\s*\{(.{0,300}?)clear_persisted_all\(\);',
-                  src, re.S)
-    assert m, 'backlog handler must clear stored data when the server is idle'
+    backlog = src[src.index('if (x.type == "backlog")'):
+                  src.index('// a new run_start_time means')]
+    assert 'if (!x.run_start_time)' not in backlog
+    assert 'apply_run_history(x.history);' in backlog
 
 
 def test_download_dump_uses_api_endpoint():

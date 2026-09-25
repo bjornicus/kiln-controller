@@ -1066,9 +1066,8 @@ class RealOven(Oven):
     def __init__(self):
         self.board = RealBoard()
         self.output = Output()
-        self.reset()
 
-        # call parent init
+        # The base constructor establishes the clock before calling reset().
         Oven.__init__(self)
 
         # start thread

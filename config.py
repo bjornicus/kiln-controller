@@ -1,7 +1,5 @@
 import logging
 import os
-from digitalio import DigitalInOut
-import busio
 
 ########################################################################
 #
@@ -12,13 +10,12 @@ log_level = logging.INFO
 log_format = '%(asctime)s %(levelname)s %(name)s: %(message)s'
 
 ### Server
-listening_port = 8081
+listening_port = 9099
 
 ########################################################################
 # Cost Information
 #
-# This is used to calculate a cost estimate before a run. It's also used
-# to produce the actual cost during a run. My kiln has three
+# This is used to produce the actual cost during a run. My kiln has three
 # elements that when my switches are set to high, consume 9460 watts.
 kwh_rate        = 0.1319  # cost per kilowatt hour per currency_type to calculate cost to run job
 kw_elements     = 9.460 # if the kiln elements are on, the wattage in kilowatts
@@ -126,9 +123,9 @@ seek_start = True
 #
 # duty cycle of the entire system in seconds
 # 
-# Every N seconds a decision is made about switching the relay[s] 
-# on & off and for how long. The thermocouple is read 
-# temperature_average_samples times during and the average value is used.
+# Every N seconds a decision is made about switching the relay[s]
+# on & off and for how long. The thermocouple is read
+# temperature_average_samples times during and the median value is used.
 sensor_time_wait = 2
 
 
@@ -140,17 +137,10 @@ sensor_time_wait = 2
 # well with the simulated oven. You must tune them to work well with 
 # your specific kiln. Note that the integral pid_ki is
 # inverted so that a smaller number means more integral action.
-pid_kp = 10   # Proportional 25,200,200
-pid_ki = 80   # Integral
-pid_kd = 220.83497910261562 # Derivative
+pid_kp = 4.112
+pid_ki = 32.972
+pid_kd = 139.384
 
-########################################################################
-#
-# Initial heating and Integral Windup
-#
-# this setting is deprecated and is no longer used. this happens by
-# default and is the expected behavior.
-stop_integral_windup = True
 
 ########################################################################
 #
@@ -161,9 +151,7 @@ sim_c_heat     = 500.0  # J/K  heat capacity of heat element
 sim_c_oven     = 5000.0 # J/K  heat capacity of oven
 sim_p_heat     = 5450.0 # W    heating power of oven
 sim_R_o_nocool = 0.5   # K/W  thermal resistance oven -> environment
-sim_R_o_cool   = 0.05   # K/W  " with cooling
 sim_R_ho_noair = 0.1    # K/W  thermal resistance heat element -> oven
-sim_R_ho_air   = 0.05   # K/W  " with internal air circulation
 
 # if you want simulations to happen faster than real time, this can be
 # set as high as 1000 to speed simulations up by 1000 times.
@@ -176,6 +164,13 @@ sim_speedup_factor = 1
 #
 # If you change the temp_scale, all settings in this file are assumed to
 # be in that scale.
+#
+# The server always works internally in celsius. settings in this file
+# (temperatures and temperature deltas like emergency_shutoff_temp,
+# throttle_below_temp, pid_control_window, thermocouple_offset, sim_t_env)
+# are written in the display scale above and converted to celsius
+# internally. all values sent to clients via the api, websockets, or
+# logging are converted back to the display scale.
 temp_scale          = "f" # c = Celsius | f = Fahrenheit - Unit to display
 time_scale_slope    = "h" # s = Seconds | m = Minutes | h = Hours - Slope displayed in temp_scale per time_scale_slope
 time_scale_profile  = "m" # s = Seconds | m = Minutes | h = Hours - Enter and view target time in time_scale_profile
@@ -186,6 +181,16 @@ time_scale_profile  = "m" # s = Seconds | m = Minutes | h = Hours - Enter and vi
 # means your kiln receives full power until your house burns down.
 # this should not replace you watching your kiln or use of a kiln-sitter
 emergency_shutoff_temp = 2264 #cone 7
+
+# emergency shutoff if the kiln cannot heat fast enough. if the target
+# temperature is rising but the kiln fails to heat at this rate over a
+# rolling window of emergency_heat_rate_window minutes, the profile is
+# aborted. this can mean a failed heating element or a relay stuck open.
+# it is only evaluated while the profile demands heating, so soaks and
+# cooling segments are ignored. rates are in display degrees per hour.
+# set emergency_heat_rate to 0 to disable this check.
+emergency_heat_rate = 23 # degrees per hour (display scale)
+emergency_heat_rate_window = 22.5 # minutes
 
 # If the current temperature is outside the pid control window,
 # delay the schedule until it does back inside. This allows for heating
@@ -199,7 +204,7 @@ kiln_must_catch_up = True
 # or 100% off because the kiln is too hot. No integral builds up
 # outside the window. The bigger you make the window, the more
 # integral you will accumulate. This should be a positive integer.
-pid_control_window = 5 #degrees
+pid_control_window = 10 #degrees
 
 # thermocouple offset
 # If you put your thermocouple in ice water and it reads 36F, you can
@@ -230,6 +235,7 @@ ac_freq_50hz = False
 # You should only set these to True if you experience a problem
 # and WANT to ignore it to complete a firing.
 ignore_temp_too_high = False
+ignore_heat_rate_too_low = False
 ignore_tc_lost_connection = False
 ignore_tc_cold_junction_range_error = False
 ignore_tc_range_error = False
@@ -246,6 +252,24 @@ ignore_tc_unknown_error = False
 ignore_tc_too_many_errors = False
 
 ########################################################################
+# alerts - detection thresholds for the web-configurable alert system
+# (see the Alerts panel on the config tab). ids line up with the alert
+# registry in lib/alerts.py. temperatures are in the display scale,
+# deltas too; conversion happens where they are used.
+#   cooled_safe        -> cooled_safe_temp
+#   relay_stuck_on     -> relay_stuck_on_rise within relay_stuck_on_window
+#   temp_implausible   -> temp_implausible_jump between two readings
+#   tc_failure         -> tc_error_percent_limit
+#   catch_up_stalled   -> catch_up_stalled_minutes
+cooled_safe_temp = 150 # below this the kiln is safe to open
+relay_stuck_on_rise = 25 # rise over the window while elements are off
+relay_stuck_on_window = 10 # minutes
+temp_implausible_jump = 50 # impossible change between two duty cycles
+tc_error_percent_limit = 30 # percent of failed reads per window
+catch_up_stalled_minutes = 15 # minutes behind schedule before alerting
+alert_webhook_timeout = 10 # seconds before giving up on a webhook post
+
+########################################################################
 # automatic restarts - if you have a power brown-out and the raspberry pi
 # reboots, this restarts your kiln where it left off in the firing profile.
 # This only happens if power comes back before automatic_restart_window
@@ -260,12 +284,55 @@ automatic_restart_window = 15 # max minutes since power outage
 automatic_restart_state_file = os.path.abspath(os.path.join(os.path.dirname( __file__ ),'state.json'))
 
 ########################################################################
+# scheduled runs - start a firing at a specific date and time.
+# schedules are persisted here so they survive a reboot.
+# The kiln-controller.py process must be running for a schedule
+# to fire. The scheduler checks every schedule_poll_interval seconds.
+schedule_state_file = os.path.abspath(os.path.join(os.path.dirname( __file__ ),'storage','schedules.json'))
+schedule_poll_interval = 1 # seconds between schedule checks
+# a firing chained after another starts this many seconds after the
+# firing it follows actually ends (not its nominal end, since catch-up
+# can stretch a run past its profile duration).
+schedule_chain_buffer = 60 # seconds
+
+########################################################################
+# alerts state - which alerts are enabled (the Alerts panel toggles).
+# persisted here so choices survive a reboot. never rename an alert id;
+# only add or retire them.
+alerts_state_file = os.path.abspath(os.path.join(os.path.dirname( __file__ ),'storage','alerts.json'))
+
+########################################################################
+# firing samples - every duty-cycle broadcast (see Oven.get_state) is
+# appended to this sqlite db so a full firing survives in queryable
+# form without relying on browser localStorage.
+firing_db_file = os.path.abspath(os.path.join(os.path.dirname( __file__ ),'db','firings.db'))
+# max firings kept in the db. older firings (and their samples) are
+# pruned at start-up on an isolated thread so the db does not grow
+# without bound. set to 0 or a negative value to keep everything.
+firing_db_max_firings = 10
+
+########################################################################
 # load kiln profiles from this directory
 # created a repo where anyone can contribute profiles. The objective is
 # to load profiles from this repository by default.
 # See https://github.com/jbruce12000/kiln-profiles
 kiln_profiles_directory = os.path.abspath(os.path.join(os.path.dirname( __file__ ),"storage", "profiles")) 
 #kiln_profiles_directory = os.path.abspath(os.path.join(os.path.dirname( __file__ ),'..','kiln-profiles','pottery')) 
+
+########################################################################
+# community kiln profiles - the Schedules tab can browse, download, and
+# share profiles with the shared kiln-profiles github repo.
+# Downloading is public. Sharing forks the repo and opens a pull request,
+# so it only needs the sharer's own github token (public_repo scope),
+# entered in the Share box on the Schedules tab.
+kiln_profiles_repo = "https://github.com/jbruce12000/kiln-profiles"
+kiln_profiles_branch = "main"
+
+# community schedules are listed from this index file (a json array with
+# name/category/tags/description per profile) instead of walking the repo
+# directory tree. the repo builds it into docs/schedules.json for github
+# pages, so it stays cheap to fetch on every browse.
+kiln_profiles_index_url = "https://jbruce12000.github.io/kiln-profiles/schedules.json"
 
 
 ########################################################################
@@ -277,3 +344,16 @@ kiln_profiles_directory = os.path.abspath(os.path.join(os.path.dirname( __file__
 # To prevent throttling, set throttle_percent to 100.
 throttle_below_temp = 300
 throttle_percent = 20
+
+########################################################################
+# mqtt telemetry - publish the oven state to an mqtt broker on every
+# sensor read. Leave all of these commented out to disable mqtt.
+# Uncomment and set mqtt_enable to True to turn it on.
+# Requires paho-mqtt (listed in requirements.txt).
+#mqtt_enable = False
+#mqtt_host = "localhost"
+#mqtt_port = 1883
+#mqtt_user = None
+#mqtt_pass = None
+#mqtt_topic = "kiln/sensor"
+#mqtt_kiln_name = "my-kiln"

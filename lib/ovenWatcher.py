@@ -1,17 +1,27 @@
 import threading,logging,json,time,datetime
-from oven import Oven
+from temp import display_profile_data
+from mqttout import enabled as mqtt_enabled, MqttOut
 log = logging.getLogger(__name__)
 
 class OvenWatcher(threading.Thread):
-    def __init__(self,oven):
+    def __init__(self,oven,db=None):
         self.last_profile = None
-        self.last_log = []
         self.started = None
-        self.recording = False
         self.observers = []
         threading.Thread.__init__(self)
         self.daemon = True
         self.oven = oven
+        self.mqtt = MqttOut() if mqtt_enabled() else None
+        # sqlite persistence for every duty cycle; a failed open must
+        # never stop heater control, so fall back to no db on error.
+        if db is None:
+            try:
+                from firing_db import FiringDb
+                db = FiringDb()
+            except Exception as e:
+                log.error("could not open firing db: %s" % e)
+                db = None
+        self.db = db
         self.start()
 
 # FIXME - need to save runs of schedules in near-real-time
@@ -25,51 +35,93 @@ class OvenWatcher(threading.Thread):
     def run(self):
         while True:
             oven_state = self.oven.get_state()
-           
-            # record state for any new clients that join
-            if oven_state.get("state") == "RUNNING":
-                self.last_log.append(oven_state)
+
+            # stamp the run start time so clients can tell when a new run
+            # has begun (from the start button, a scheduled run, an api
+            # command, or an automatic restart). idle broadcasts carry
+            # None: reusing the previous stamp would attach idle samples
+            # to the finished firing in the db.
+            try:
+                active = self.active_run_started()
+            except Exception:
+                active = None
+            if active is not None:
+                oven_state['run_started'] = active.timestamp()
             else:
-                self.recording = False
+                # drop the identity the moment the oven goes idle so
+                # the backlog and later broadcasts cannot reuse it
+                if getattr(self, 'started', None) is not None and \
+                        getattr(getattr(self, 'oven', None),
+                                'state', None) not in ('RUNNING', 'PAUSED'):
+                    self.started = None
+                oven_state['run_started'] = None
+
+            if self.mqtt:
+                self.mqtt.publish(oven_state)
+
+            # persist the same broadcast locally every duty cycle.
+            # getattr: tests build watchers via __new__ without __init__,
+            # so self.db may not exist; db failures must never break
+            # the broadcast loop.
+            try:
+                db = getattr(self, 'db', None)
+                if db is not None:
+                    db.record_state(oven_state)
+            except Exception as e:
+                log.error("firing db write failed: %s" % e)
+
             self.notify_all(oven_state)
             time.sleep(self.oven.time_step)
 
-    def lastlog_subset(self,maxpts=50):
-        '''send about maxpts from lastlog by skipping unwanted data'''
-        totalpts = len(self.last_log)
-        if (totalpts <= maxpts):
-            return self.last_log
-        every_nth = int(totalpts / (maxpts - 1))
-        return self.last_log[::every_nth]
-
-    def record(self, profile):
+    def record(self, profile, started=None):
         self.last_profile = profile
-        self.last_log = []
-        self.started = datetime.datetime.now()
-        self.recording = True
-        #we just turned on, add first state for nice graph
-        self.last_log.append(self.oven.get_state())
+        if started is None:
+            self.started = datetime.datetime.now()
+        elif isinstance(started, datetime.datetime):
+            self.started = started
+        else:
+            # epoch seconds (e.g. restored after an automatic restart
+            # so the resumed firing keeps its original identity)
+            self.started = datetime.datetime.fromtimestamp(float(started))
+
+    def clear(self):
+        '''end the current run identity. called when a firing ends so
+        later idle broadcasts carry run_started=None instead of the
+        previous firing's stamp (which would attach idle samples to
+        that firing in the db and make the ui think a run is still
+        in progress). last_profile is kept for display.'''
+        self.started = None
+
+    def active_run_started(self):
+        '''run start time while a firing is active, else None. gates
+        on the oven state so a stale stamp can never leak into idle
+        broadcasts, backlogs, or db writes.'''
+        if getattr(getattr(self, 'oven', None), 'state', None) \
+                not in ('RUNNING', 'PAUSED'):
+            return None
+        return getattr(self, 'started', None)
 
     def add_observer(self,observer):
         if self.last_profile:
             p = {
                 "name": self.last_profile.name,
-                "data": self.last_profile.data, 
+                "data": display_profile_data(self.last_profile.data),
                 "type" : "profile"
             }
         else:
             p = None
         
+        try:
+            active = self.active_run_started()
+        except Exception:
+            active = None
         backlog = {
             'type': "backlog",
             'profile': p,
-            'log': self.lastlog_subset(),
-            #'started': self.started
+            'run_started': active.timestamp() if active else None,
         }
-        print(backlog)
         backlog_json = json.dumps(backlog)
         try:
-            print(backlog_json)
             observer.send(backlog_json)
         except:
             log.error("Could not send backlog to new observer")
@@ -80,7 +132,9 @@ class OvenWatcher(threading.Thread):
         message_json = json.dumps(message)
         log.debug("sending to %d clients: %s"%(len(self.observers),message_json))
 
-        for wsock in self.observers:
+        # iterate over a copy: removing a dead socket mid-loop would
+        # otherwise skip the socket right after it
+        for wsock in list(self.observers):
             if wsock:
                 try:
                     wsock.send(message_json)

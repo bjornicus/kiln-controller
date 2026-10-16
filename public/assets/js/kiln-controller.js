@@ -1,0 +1,2735 @@
+var state = "IDLE";
+var state_last = "";
+var run_started = null;
+var running_profile_name = null;
+var running_profile_name_last = null;
+var backlog_profile_name = null;
+var oven_status = null;
+var graph = {
+    profile: { label: "Profile", data: [], color: "#75890c", draggable: false, visible: true },
+    live: { label: "Live", data: [], color: "#ffffff", draggable: false, visible: true }
+};
+var profiles = [];
+var selected_profile = 0;
+var selected_profile_name = '';
+var temp_scale = "c";
+var time_scale_slope = "s";
+var time_scale_profile = "h";
+var time_scale_long = "Seconds";
+var temp_scale_display = "C";
+var kwh_rate = 0.26;
+var currency_type = "EUR";
+var simulate = false;
+var upload_enabled = false;
+var remote_profiles_loaded = false;
+var remote_profiles = [];
+
+var PROFILE_DS = 0;
+var LIVE_DS = 1;
+
+var chart = null;
+
+// tuning state
+var all = [];
+var STORAGE_KEY = 'kiln-controller-all';
+try {
+    var saved_all = localStorage.getItem(STORAGE_KEY);
+    if (saved_all) {
+        var parsed_all = JSON.parse(saved_all);
+        if (Array.isArray(parsed_all)) { all = parsed_all; }
+    }
+} catch (e) {
+    all = [];
+}
+// high-water mark: max pidstats.time seen via history or live feed.
+// live ticks at or below it are duplicates of backfilled history and
+// must not be appended twice. localStorage is only a warm cache now
+// (the server db is the source of truth), so re-seed from it.
+var last_sample_time = -Infinity;
+for (var _ri = 0; _ri < all.length; _ri++) {
+    if (all[_ri].time > last_sample_time) { last_sample_time = all[_ri].time; }
+}
+// guards history backfills: each fetch gets a sequence number and the
+// run it targets; stale responses (superseded, or for a previous run)
+// are discarded instead of corrupting the current graphs.
+var history_seq = 0;
+var history_loaded_for = null;
+var charts = {};
+var detailsInited = false;
+
+var save_timer = null;
+function persist_all() {
+    if (save_timer) { return; }
+    save_timer = setTimeout(function() {
+        save_timer = null;
+        try {
+            var slice = all.length > 6000 ? all.slice(-6000) : all;
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(slice));
+        } catch (e) {}
+    }, 2000);
+}
+function flush_all() {
+    if (save_timer) {
+        clearTimeout(save_timer);
+        save_timer = null;
+    }
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(all.slice(-6000)));
+    } catch (e) {}
+}
+function clear_persisted_all() {
+    all = [];
+    last_sample_time = -Infinity;
+    history_loaded_for = null;
+    history_seq++;
+    if (save_timer) {
+        clearTimeout(save_timer);
+        save_timer = null;
+    }
+    try {
+        localStorage.removeItem(STORAGE_KEY);
+    } catch (e) {}
+    if (detailsInited) {
+        drawall(windowed_data());
+    }
+}
+function prune_persisted_all(cutoff) {
+    // keep only details recorded at or after the run start time, so a page
+    // that loads (or reconnects) mid-firing never shows artifacts from an
+    // earlier firing. entries are dropped from memory and localStorage but
+    // the current run's data is preserved.
+    all = all.filter(function(d) { return d.time >= cutoff; });
+    if (save_timer) {
+        clearTimeout(save_timer);
+        save_timer = null;
+    }
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(all.slice(-6000)));
+    } catch (e) {}
+    if (detailsInited) {
+        drawall(windowed_data());
+    }
+}
+window.addEventListener('pagehide', flush_all);
+
+/* ---------------------------------------------------------------------------
+   Firing history backfill - the db is the source of truth for what has
+   happened so far in the current firing. a client that joins mid-firing
+   (or comes back after a drop) fetches /api/history once per run and
+   merges it with the live websocket feed:
+   - the overview series is replaced with the full firing (plus any live
+     points that arrived after the history snapshot),
+   - details entries are appended only when newer than last_sample_time,
+     so reconnect gaps close without duplicating anything.
+   graphs redraw from the merge; numeric displays keep updating from the
+   live ticks (next tick at most ~2s away).
+--------------------------------------------------------------------------- */
+
+function historyEntryFromRow(cols, row) {
+    // one HISTORY_COLS row -> {live, detail}, applying the same
+    // transforms the live path applies (err negated, out as percent,
+    // derived datetime/catchingup) so history and live render alike.
+    function v(name) {
+        var i = cols.indexOf(name);
+        return i < 0 ? null : row[i];
+    }
+    var t = v('t');
+    var err = v('err');
+    var out = v('out');
+    var cu = !!v('cu');
+    var ispoint = v('isp');
+    var detail = {
+        time: t,
+        timeDelta: v('td'),
+        setpoint: v('sp'),
+        ispoint: ispoint,
+        err: (err === null || err === undefined) ? err : -err,
+        errDelta: v('ed'),
+        p: v('p'),
+        i: v('i'),
+        d: v('d'),
+        kp: v('kp'),
+        ki: v('ki'),
+        kd: v('kd'),
+        pid: v('pid'),
+        out: (out === null || out === undefined) ? out : out * 100,
+        datetime: (t === null || t === undefined) ? '' : unix_to_yymmdd_hhmmss(t),
+        catching_up: cu,
+        temp_errors: v('te')
+    };
+    if (cu) { detail.catchingup = ispoint; }
+    return { live: [v('rt'), v('temp'), t], detail: detail };
+}
+
+function mergeHistory(cols, rows) {
+    // fold a full-firing history snapshot into the live structures.
+    // returns the number of details entries appended. stale live
+    // points (already covered by the snapshot) are dropped; live
+    // points newer than the snapshot are kept after it.
+    var fresh = [];
+    var added = 0;
+    var maxT = last_sample_time;
+    var snapMax = -Infinity;
+    var i, h;
+    for (i = 0; i < rows.length; i++) {
+        h = historyEntryFromRow(cols, rows[i]);
+        fresh.push(h.live);
+        if (h.detail.time !== null && h.detail.time !== undefined &&
+                h.detail.time > last_sample_time) {
+            all.push(h.detail);
+            added++;
+        }
+        if (h.detail.time > maxT) { maxT = h.detail.time; }
+        if (h.detail.time > snapMax) { snapMax = h.detail.time; }
+    }
+    // keep live points the snapshot does not cover (arrived after it
+    // was taken, or timeless): the snapshot can lag the watermark when
+    // live ticks landed during the fetch.
+    var tail = [];
+    for (i = 0; i < graph.live.data.length; i++) {
+        var p = graph.live.data[i];
+        if (p.length < 3 || p[2] === null || p[2] === undefined || p[2] > snapMax) {
+            tail.push(p);
+        }
+    }
+    graph.live.data = fresh.concat(tail);
+    last_sample_time = maxT;
+    if (added) { persist_all(); }
+    syncChartData();
+    updateAxis();
+    if (detailsInited) { drawall(windowed_data()); }
+    return added;
+}
+
+function backfillHistory(rs) {
+    // fetch this firing's history once per run; concurrent or stale
+    // responses are discarded via the sequence guard and run check.
+    var seq = ++history_seq;
+    apiGet('/api/history?run_started=' + encodeURIComponent(rs), function(resp) {
+        if (seq !== history_seq) { return; }
+        if (rs !== run_started) { return; }
+        if (!resp || !resp.success) { return; }
+        history_loaded_for = rs;
+        var rows = resp.rows || [];
+        mergeHistory(resp.cols, rows);
+        // temporary toast reporting the transfer; auto-dismisses.
+        if (rows.length > 0) {
+            showGrowl('<i class="bi bi-database"></i>&nbsp;Loaded ' + rows.length + ' points of firing history.', 'success', 5000);
+        }
+    });
+}
+
+var TABS = ['overview', 'details', 'profiles', 'config'];
+
+var protocol = 'ws:';
+if (window.location.protocol == 'https:') {
+    protocol = 'wss:';
+}
+var host = "" + protocol + "//" + window.location.hostname + ":" + window.location.port;
+var ws_status = make_socket('status');
+var ws_control = make_socket('control');
+var ws_config = make_socket('config');
+var ws_storage = make_socket('storage');
+
+var reconnect_attempts = {};
+var reconnect_max_delay = 15000;
+var reconnect_pending = {};
+
+function make_socket(name) {
+    var ws = new WebSocket(host + '/' + name);
+    window['ws_' + name] = ws;
+    return ws;
+}
+
+function schedule_reconnect(name) {
+    // a single guard flag stops a close cascade from scheduling several
+    // reconnects: the onclose handlers of previously-created sockets are
+    // chained, so one close event can invoke schedule_reconnect more than
+    // once. the flag is cleared when the reconnect timer fires.
+    if (reconnect_pending[name]) { return; }
+    reconnect_pending[name] = true;
+    var old = window['ws_' + name];
+    var onopen = old.onopen;
+    var onmessage = old.onmessage;
+    var onclose = old.onclose;
+    var attempts = (reconnect_attempts[name] || 0) + 1;
+    reconnect_attempts[name] = attempts;
+    var delay = Math.min(3000 * Math.pow(2, attempts - 1), reconnect_max_delay);
+    setTimeout(function() {
+        reconnect_pending[name] = false;
+        var ws = make_socket(name);
+        ws.onopen = function() {
+            if (name === 'status' && reconnect_attempts[name] > 0) {
+                reconnect_attempts[name] = 0;
+                showGrowl('Reconnected to controller.', 'success', 5000);
+            }
+            if (onopen) onopen.call(ws);
+        };
+        ws.onmessage = onmessage;
+        ws.onclose = function() {
+            if (onclose) onclose();
+            schedule_reconnect(name);
+        };
+    }, delay);
+}
+
+var socket_states = {
+    status: false,
+    control: false,
+    config: false,
+    storage: false
+};
+
+function update_conn_indicator() {
+    var all = socket_states.status && socket_states.control &&
+              socket_states.config && socket_states.storage;
+    var el = $('conn_indicator');
+    if (all) {
+        el.classList.add('connected');
+        el.classList.remove('disconnected');
+        $('conn_text').innerHTML = 'Connected';
+    }
+    else {
+        el.classList.remove('connected');
+        el.classList.add('disconnected');
+        $('conn_text').innerHTML = 'Reconnecting';
+    }
+}
+
+function socket_opened(name) {
+    socket_states[name] = true;
+    update_conn_indicator();
+}
+
+function socket_closed(name) {
+    socket_states[name] = false;
+    update_conn_indicator();
+}
+
+function $(id) {
+    return document.getElementById(id);
+}
+
+function show(el) {
+    el.style.display = '';
+}
+
+function hide(el) {
+    el.style.display = 'none';
+}
+
+function showGrowl(html, type, delay) {
+    var container = $('toastContainer');
+    var toast = document.createElement('div');
+    toast.className = 'toast align-items-center text-white border-0';
+    toast.setAttribute('role', 'alert');
+    if (type == 'success') { toast.classList.add('bg-success'); }
+    else if (type == 'error') { toast.classList.add('bg-danger'); }
+    else { toast.classList.add('bg-dark'); }
+    toast.innerHTML = '<div class="d-flex"><div class="toast-body">' + html + '</div>' +
+        '<button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button></div>';
+    container.appendChild(toast);
+    var bsToast = new bootstrap.Toast(toast, { delay: (delay === undefined ? 5000 : delay) });
+    toast.addEventListener('hidden.bs.toast', function() { toast.remove(); });
+    bsToast.show();
+}
+
+/* ---------------------------------------------------------------------------
+   Tabs
+--------------------------------------------------------------------------- */
+
+function openTabFromHash() {
+    var h = window.location.hash.replace('#', '');
+    if (TABS.indexOf(h) !== -1) {
+        showTab(h);
+    } else {
+        showTab('overview');
+    }
+}
+
+function showTab(name) {
+    for (var i = 0; i < TABS.length; i++) {
+        var pane = $('tab-' + TABS[i]);
+        if (pane) {
+            pane.style.display = (TABS[i] === name) ? '' : 'none';
+        }
+    }
+    var links = document.querySelectorAll('.nav-link[data-tab]');
+    for (var j = 0; j < links.length; j++) {
+        if (links[j].getAttribute('data-tab') === name) {
+            links[j].classList.add('active');
+        } else {
+            links[j].classList.remove('active');
+        }
+    }
+    if (name === 'details') {
+        initDetails();
+        loadFirings();
+    } else if (name === 'profiles') {
+        renderProfiles();
+        loadRemoteProfiles();
+    } else if (name === 'config') {
+        loadConfigEditor();
+        loadAlerts();
+    } else if (name === 'overview' && chart) {
+        chart.resize();
+    }
+}
+
+function initDetails() {
+    if (!detailsInited) {
+        create_charts();
+        drawall(all);
+        detailsInited = true;
+        return;
+    }
+    var k;
+    for (k in charts) {
+        if (charts.hasOwnProperty(k)) {
+            charts[k].resize();
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Theme toggle
+--------------------------------------------------------------------------- */
+
+function currentTheme() {
+    return document.documentElement.classList.contains('light') ? 'light' : 'dark';
+}
+
+function toggleTheme() {
+    setTheme(currentTheme() === 'light' ? 'dark' : 'light');
+}
+
+function setTheme(theme) {
+    var root = document.documentElement;
+    if (theme === 'light') {
+        root.classList.add('light');
+    } else {
+        root.classList.remove('light');
+    }
+    try {
+        localStorage.setItem('kiln-theme', theme);
+    } catch (e) {}
+    var icon = $('theme_icon');
+    if (icon) {
+        icon.className = theme === 'light' ? 'bi bi-sun' : 'bi bi-moon-stars';
+    }
+    applyChartTheme();
+}
+
+function themeColors() {
+    var light = currentTheme() === 'light';
+    return {
+        axis: light ? 'rgba(40,38,34,0.75)' : 'rgba(216,211,197,0.85)',
+        axisDim: light ? 'rgba(40,38,34,0.6)' : 'rgba(216,211,197,0.7)',
+        grid: light ? 'rgba(40,38,34,0.14)' : 'rgba(216,211,197,0.2)',
+        gridDim: light ? 'rgba(40,38,34,0.1)' : 'rgba(216,211,197,0.15)',
+        live: light ? '#4a4640' : '#ffffff',
+        liveFill: light ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.18)'
+    };
+}
+
+function applyChartTheme() {
+    var tc = themeColors();
+    if (chart) {
+        var ds = chart.data.datasets;
+        if (ds[LIVE_DS]) {
+            ds[LIVE_DS].borderColor = tc.live;
+            ds[LIVE_DS].backgroundColor = tc.liveFill;
+        }
+        chart.options.scales.x.ticks.color = tc.axis;
+        chart.options.scales.y.ticks.color = tc.axis;
+        chart.options.scales.x.grid.color = tc.grid;
+        chart.options.scales.y.grid.color = tc.grid;
+        chart.update('none');
+    }
+    for (var k in charts) {
+        if (charts.hasOwnProperty(k) && charts[k]) {
+            var c = charts[k];
+            c.options.scales.x.ticks.color = tc.axisDim;
+            c.options.scales.y.ticks.color = tc.axisDim;
+            c.options.scales.x.grid.color = tc.gridDim;
+            c.options.scales.y.grid.color = tc.gridDim;
+            if (c.options.plugins && c.options.plugins.legend && c.options.plugins.legend.labels) {
+                c.options.plugins.legend.labels.color = tc.axis;
+            }
+            c.data.datasets.forEach(function(ds2) {
+                if (ds2.label === 'temp') {
+                    ds2.borderColor = tc.live;
+                    ds2.backgroundColor = tc.live;
+                }
+            });
+            c.update('none');
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   Overview graph
+--------------------------------------------------------------------------- */
+
+function createChart() {
+    var tc = themeColors();
+    chart = new Chart($('graph_canvas'), {
+        type: 'line',
+        data: {
+            datasets: [
+                {
+                    label: 'Profile',
+                    data: [],
+                    order: 2,
+                    borderColor: '#75890c',
+                    backgroundColor: '#75890c',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    pointBackgroundColor: '#75890c',
+                    pointBorderColor: '#75890c',
+                    pointHitRadius: 30,
+                    pointHoverRadius: 6,
+                    showLine: true,
+                    fill: false,
+                    spanGaps: true,
+                    tension: 0,
+                    dragData: false
+                },
+                {
+                    label: 'Live',
+                    data: [],
+                    order: 1,
+                    borderColor: tc.live,
+                    backgroundColor: tc.liveFill,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    showLine: true,
+                    fill: false,
+                    spanGaps: true,
+                    tension: 0,
+                    dragData: false
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            interaction: { mode: 'nearest', intersect: true },
+            plugins: {
+                legend: { display: false },
+                tooltip: { enabled: false },
+                dragData: {
+                    dragX: true,
+                    dragY: true,
+                    round: 0,
+                    showTooltip: false,
+                    onDrag: dragUpdate,
+                    onDragEnd: dragEnd
+                }
+            },
+            scales: {
+                x: {
+                    type: 'linear',
+                    min: 0,
+                    ticks: {
+                        stepSize: 3600,
+                        maxRotation: 0,
+                        callback: timeTickFormatter,
+                        color: tc.axis,
+                        font: { family: "Digi", size: 14, weight: "normal" }
+                    },
+                    grid: { color: tc.grid }
+                },
+                y: {
+                    type: 'linear',
+                    min: 0,
+                    ticks: {
+                        stepSize: 50,
+                        color: tc.axis,
+                        font: { family: "Digi", size: 14, weight: "normal" }
+                    },
+                    grid: { color: tc.grid }
+                }
+            }
+        }
+    });
+}
+
+function syncChartData() {
+    var ds = chart.data.datasets;
+    ds[PROFILE_DS].data = graph.profile.data.map(function(p) { return { x: p[0], y: p[1] }; });
+    ds[LIVE_DS].data = graph.live.data.map(function(p) { return { x: p[0], y: p[1] }; });
+    chart.update('none');
+}
+
+function axisStep(max) {
+    if (max > 3600) { return 3600; }
+    if (max > 360) { return 120; }
+    if (max > 60) { return 60; }
+    return 1;
+}
+
+function yStep(max) {
+    if (max > 1000) { return 200; }
+    if (max > 500) { return 100; }
+    if (max > 200) { return 50; }
+    return 25;
+}
+
+function updateAxis() {
+    var minX = Infinity, maxX = 0, maxY = 0;
+    var allpts = graph.profile.data.concat(graph.live.data);
+    for (var i = 0; i < allpts.length; i++) {
+        if (allpts[i][0] > maxX) { maxX = allpts[i][0]; }
+        if (allpts[i][0] < minX) { minX = allpts[i][0]; }
+        if (allpts[i][1] > maxY) { maxY = allpts[i][1]; }
+    }
+    if (minX === Infinity) { minX = 0; }
+    var xs = axisStep(maxX);
+    chart.options.scales.x.min = minX > 0 ? Math.floor(minX / xs) * xs : 0;
+    chart.options.scales.x.max = maxX > 0 ? Math.ceil(maxX / xs) * xs : xs;
+    chart.options.scales.x.ticks.stepSize = xs;
+    var ys = yStep(maxY);
+    chart.options.scales.y.min = 0;
+    chart.options.scales.y.max = maxY > 0 ? Math.ceil(maxY / ys) * ys : 100;
+    chart.options.scales.y.ticks.stepSize = ys;
+    chart.update('none');
+}
+
+function dragUpdate(e, datasetIndex, index, value) {
+    if (datasetIndex !== PROFILE_DS) { return; }
+    if (value === null || value === undefined || value.x === undefined) { return; }
+    value.x = Math.max(0, value.x);
+    value.y = Math.max(0, value.y);
+    graph.profile.data[index] = [value.x, value.y];
+    if (value.x > chart.options.scales.x.max) {
+        var xs = axisStep(value.x);
+        chart.options.scales.x.max = Math.ceil(value.x / xs) * xs;
+    }
+    if (value.y > chart.options.scales.y.max) {
+        var ys = yStep(value.y);
+        chart.options.scales.y.max = Math.ceil(value.y / ys) * ys;
+    }
+}
+
+function dragEnd(e, datasetIndex, index, value) {
+    if (datasetIndex !== PROFILE_DS) { return; }
+    if (value !== null && value !== undefined && value.x !== undefined) {
+        graph.profile.data[index] = [value.x, value.y];
+    }
+    updateAxis();
+    updateProfileTable();
+}
+
+function setEditMode(on) {
+    chart.data.datasets[PROFILE_DS].pointRadius = on ? 4 : 0;
+    chart.data.datasets[PROFILE_DS].pointHitRadius = on ? 30 : 0;
+    chart.data.datasets[PROFILE_DS].dragData = !!on;
+    chart.update('none');
+}
+
+/* ---------------------------------------------------------------------------
+   Overview profile operations
+--------------------------------------------------------------------------- */
+
+   function updateProfile(id)
+   {
+       selected_profile = id;
+       selected_profile_name = profiles[id].name;
+       graph.profile.data = profiles[id].data;
+       if (state != "RUNNING" && state != "PAUSED") {
+           // A fresh page load mid-firing backfills the white live
+           // series from the db, but the profiles list arrives over
+           // its own socket and often lands after that backfill (a
+           // shift-reload reorders the arrivals). Wiping here would
+           // discard the just-loaded history, so only clear live data
+           // when leaving the firing's own schedule.
+           var firing_name = running_profile_name || backlog_profile_name;
+           if (profiles[id].name !== firing_name) {
+               graph.live.data = [];
+           }
+       }
+       syncChartData();
+       updateAxis();
+       updateProfileTable();
+       renderProfiles();
+       updateSelectedProfileLabel();
+   }
+
+   function profileDescription(name)
+   {
+       if (typeof profiles === 'undefined') { return ''; }
+       for (var i = 0; i < profiles.length; i++) {
+           if (profiles[i].name === name) { return profiles[i].description || ''; }
+       }
+       return '';
+   }
+
+   function updateSelectedProfileLabel()
+   {
+       var label = $('selected_profile_label');
+       if (!label) { return; }
+       var name = running_profile_name || selected_profile_name;
+       label.innerHTML = name || 'Select Profile';
+       label.title = profileDescription(name);
+   }
+
+    function toggleSimBadge(show)
+    {
+        var badge = document.getElementById('sim_badge');
+        if (!badge) { return; }
+        badge.style.display = show ? 'inline-flex' : 'none';
+    }
+
+    function updateOverviewStatus()
+    {
+        var badge = document.getElementById('overview_status');
+        if (!badge) { return; }
+        var status = {
+            IDLE:    { label: 'Idle',    color: 'secondary' },
+            RUNNING: { label: 'Running', color: 'success' },
+            PAUSED:  { label: 'Paused',  color: 'warning' },
+            TUNING:  { label: 'Tuning',  color: 'info' }
+        }[state] || { label: state || 'Idle', color: 'secondary' };
+        badge.className = 'badge overview-status text-bg-' + status.color;
+        badge.innerHTML = status.label;
+    }
+
+    function updateOverviewTemps(temperature, target)
+    {
+        // Actual tracks the live sensor even when idle so the kiln temp
+        // stays visible while it cools after a firing; a '--' target
+        // means no schedule is driving the kiln (idle).
+        var t = document.getElementById('overview_temp');
+        if (t && temperature !== undefined && temperature !== null && temperature !== '--') { t.innerHTML = rnd(temperature); }
+        var s = document.getElementById('overview_target');
+        if (s && target !== undefined && target !== null) {
+            s.innerHTML = (target === '--' ? '--' : rnd(target));
+        }
+    }
+
+   function adoptProfile(name)
+   {
+       if (!name) { return; }
+       for (var i = 0; i < profiles.length; i++) {
+           if (profiles[i].name == name) {
+               selected_profile_name = name;
+               updateProfile(i);
+               return;
+           }
+       }
+   }
+
+function deleteProfile()
+{
+    var profile = { "type": "profile", "data": "", "name": selected_profile_name };
+    var delete_struct = { "cmd": "DELETE", "profile": profile };
+
+    ws_storage.send(JSON.stringify(delete_struct));
+    ws_storage.send('GET');
+
+    remote_profiles_loaded = false;
+    loadRemoteProfiles();
+
+    if (profiles.length > 0) { selected_profile_name = profiles[0].name; }
+
+    state="IDLE";
+    hide($('profile_editor'));
+    updateSelectedProfileLabel();
+    setEditMode(false);
+    syncChartData();
+    updateAxis();
+    chart.resize();
+}
+
+function slopeIcon(slope) {
+    if (slope == "up") { return "bi-arrow-up-circle"; }
+    if (slope == "down") { return "bi-arrow-down-circle"; }
+    return "bi-arrow-right-circle";
+}
+
+function updateProfileTable()
+{
+    var dps = 0;
+    var slope = "";
+    var color = "";
+
+    var html = '<h3>Schedule Points</h3><div class="table-responsive" style="scroll: none"><table class="table table-striped">';
+        html += '<tr><th style="width: 50px">#</th><th>Target Time in ' + time_scale_long+ '</th><th>Target Temperature in °'+temp_scale_display+'</th><th>Slope in &deg;'+temp_scale_display+'/'+time_scale_slope+'</th><th>Action</th></tr>';
+
+    for(var i=0; i<graph.profile.data.length;i++)
+    {
+        if (i>=1) dps =  ((graph.profile.data[i][1]-graph.profile.data[i-1][1])/(graph.profile.data[i][0]-graph.profile.data[i-1][0]) * 10) / 10;
+        if (dps  > 0) { slope = "up";     color="rgba(206, 5, 5, 1)"; } else
+        if (dps  < 0) { slope = "down";   color="rgba(23, 108, 204, 1)"; dps *= -1; } else
+        if (dps == 0) { slope = "right";  color="grey"; }
+
+        html += '<tr><td><h4>' + (i+1) + '</h4></td>';
+        html += '<td><input type="text" class="form-control point-input" id="profiletable-0-'+i+'" value="'+ timeProfileFormatter(graph.profile.data[i][0],true) + '" /></td>';
+        html += '<td><input type="text" class="form-control point-input" id="profiletable-1-'+i+'" value="'+ graph.profile.data[i][1] + '" /></td>';
+        html += '<td><div class="input-group"><span class="bi ' + slopeIcon(slope) + ' input-group-text ds-trend" style="background: '+color+'"></span><input type="text" class="form-control ds-input ds-slope" readonly value="' + formatDPS(dps) + '" /></div></td>';
+        html += '<td><div class="btn-group btn-group-sm">';
+        html += '<button type="button" class="btn btn-outline-secondary" onclick="newPointAt(' + i + ')" title="Add point after"><i class="bi bi-plus"></i></button>';
+        html += '<button type="button" class="btn btn-outline-danger" onclick="delPointAt(' + i + ')" title="Delete point"><i class="bi bi-dash-lg"></i></button>';
+        html += '</div></td></tr>';
+    }
+
+    html += '</table></div>';
+
+    $('profile_table').innerHTML = html;
+}
+
+function timeProfileFormatter(val, down) {
+    var rval = val
+    switch(time_scale_profile){
+        case "m":
+            if (down) {rval = val / 60;} else {rval = val * 60;}
+            break;
+        case "h":
+            if (down) {rval = val / 3600;} else {rval = val * 3600;}
+            break;
+    }
+    return Math.round(rval);
+}
+
+function formatDPS(val) {
+    var tval = val;
+    if (time_scale_slope == "m") {
+        tval = val * 60;
+    }
+    if (time_scale_slope == "h") {
+        tval = (val * 60) * 60;
+    }
+    return Math.round(tval);
+}
+
+function timeTickFormatter(val) {
+    var max = this.max;
+    if(max>3600) {
+        return Math.floor(val/3600);
+    }
+    if(max>60) {
+        return Math.floor(val/60);
+    }
+    return val;
+}
+
+function runTask()
+{
+    var cmd =
+    {
+        "cmd": "RUN",
+        "profile": profiles[selected_profile]
+    }
+
+    graph.live.data = [];
+    syncChartData();
+    updateAxis();
+
+    clear_persisted_all();
+
+    ws_control.send(JSON.stringify(cmd));
+
+}
+
+function abortTask()
+{
+    var cmd = {"cmd": "STOP"};
+    ws_control.send(JSON.stringify(cmd));
+}
+
+function enterNewMode()
+{
+    state="EDIT"
+    show($('profile_editor'));
+    $('form_profile_name').value = '';
+    $('form_profile_name').setAttribute('placeholder', 'Please enter a name');
+    $('form_profile_description').value = '';
+    graph.profile.data = [];
+    syncChartData();
+    updateAxis();
+    updateProfileTable();
+    show($('profile_table'));
+    showTab('profiles');
+}
+
+function enterEditMode(i)
+{
+    if (i === undefined) { i = selected_profile; }
+    var prof = profiles[i];
+    if (!prof) { return; }
+    state="EDIT";
+    show($('profile_editor'));
+    $('form_profile_name').value = prof.name;
+    $('form_profile_description').value = prof.description || '';
+    graph.profile.data = prof.data;
+    syncChartData();
+    updateAxis();
+    updateProfileTable();
+    show($('profile_table'));
+    showTab('profiles');
+}
+
+function leaveEditMode()
+{
+    // keep the selection unchanged unless this was a brand new schedule
+    // (or a rename), in which case adopt the name that was just worked on.
+    var name = $('form_profile_name').value;
+    var exists = false;
+    for (var i = 0; i < profiles.length; i++) {
+        if (profiles[i].name === name) { exists = true; break; }
+    }
+    if (!exists) { selected_profile_name = name; }
+    ws_storage.send('GET');
+    state="IDLE";
+    hide($('profile_editor'));
+    hide($('profile_table'));
+    setEditMode(false);
+    syncChartData();
+    updateAxis();
+    renderProfiles();
+}
+
+function newPoint()
+{
+    var pointx;
+    if(graph.profile.data.length > 0)
+    {
+        pointx = parseInt(graph.profile.data[graph.profile.data.length-1][0])+15;
+    }
+    else
+    {
+        pointx = 0;
+    }
+    graph.profile.data.push([pointx, Math.floor((Math.random()*230)+25)]);
+    syncChartData();
+    updateAxis();
+    updateProfileTable();
+}
+
+function delPoint()
+{
+    graph.profile.data.splice(-1,1)
+    syncChartData();
+    updateAxis();
+    updateProfileTable();
+}
+
+function delPointAt(i)
+{
+    graph.profile.data.splice(i,1)
+    syncChartData();
+    updateAxis();
+    updateProfileTable();
+}
+
+function newPointAt(i)
+{
+    var pointx;
+    var pointy;
+    if (graph.profile.data.length > 0) {
+        var cur = graph.profile.data[i];
+        var next = graph.profile.data[i+1];
+        pointx = next ? parseInt((cur[0] + next[0]) / 2) : parseInt(cur[0]) + 15;
+        pointy = cur[1];
+    } else {
+        pointx = 0;
+        pointy = 25;
+    }
+    graph.profile.data.splice(i+1, 0, [pointx, pointy]);
+    syncChartData();
+    updateAxis();
+    updateProfileTable();
+}
+
+function toggleTable()
+{
+    var t = $('profile_table');
+    if(t.style.display == 'none')
+    {
+        show(t);
+    }
+    else
+    {
+        hide(t);
+    }
+}
+
+function toggleLive()
+{
+    graph.live.visible = !graph.live.visible;
+    chart.data.datasets[LIVE_DS].hidden = !graph.live.visible;
+    chart.update('none');
+}
+
+function slugifyProfileName(name) {
+    // schedule names become filenames (<name>.json), so only a safe
+    // character set survives saving: runs of whitespace become a
+    // single dash, anything outside letters/numbers/dots/dashes/
+    // underscores is dropped, and leading/trailing dots and dashes
+    // are trimmed. returns '' when nothing usable remains.
+    return String(name == null ? '' : name)
+        .trim()
+        .replace(/\s+/g, '-')
+        .replace(/[^A-Za-z0-9._-]+/g, '')
+        .replace(/^[-.]+/, '')
+        .replace(/[-.]+$/, '');
+}
+
+function saveProfile()
+{
+    var name = slugifyProfileName($('form_profile_name').value);
+    if (!name) {
+        showGrowl("<i class=\"bi bi-exclamation-triangle-fill\"></i> <b>ERROR 94:</b><br/>Please enter a schedule name using letters, numbers, dots, dashes or underscores.", 'error', 5000);
+        return false;
+    }
+    // show the name that will actually be saved
+    $('form_profile_name').value = name;
+    var data = [];
+    var last = -1;
+
+    for(var i=0; i<graph.profile.data.length;i++)
+    {
+        var p = graph.profile.data[i];
+        if(p[0] > last)
+        {
+          data.push([p[0], p[1]]);
+        }
+        else
+        {
+          showGrowl("<i class=\"bi bi-exclamation-triangle-fill\"></i> <b>ERROR 88:</b><br/>An oven is not a time-machine", 'error', 5000);
+          return false;
+        }
+
+        last = p[0];
+    }
+
+    var profile = { "type": "profile", "data": data, "name": name, "description": $('form_profile_description').value }
+    var put = { "cmd": "PUT", "profile": profile }
+
+    ws_storage.send(JSON.stringify(put));
+
+    leaveEditMode();
+}
+
+function overwriteProfile()
+{
+    saveProfile();
+}
+
+/* ---------------------------------------------------------------------------
+   Profiles tab
+--------------------------------------------------------------------------- */
+
+function apiPost(obj, cb) {
+    fetch('/api', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(obj)
+    })
+    .then(function(r) { return r.json(); })
+    .then(cb)
+    .catch(function(err) {
+        showGrowl('API error: ' + err, 'error', 5000);
+    });
+}
+
+function apiGet(url, cb) {
+    fetch(url)
+    .then(function(r) { return r.json(); })
+    .then(cb)
+    .catch(function(err) {
+        showGrowl('API error: ' + err, 'error', 5000);
+    });
+}
+
+/* ---------------------------------------------------------------------------
+   Community schedules - browse, install, and share profiles with the
+   kiln-profiles github repo.
+--------------------------------------------------------------------------- */
+
+function loadRemoteProfiles(force) {
+    if (!force && remote_profiles_loaded) { return; }
+    var list = $('remote_profiles_list');
+    if (!list) { return; }
+    list.innerHTML = '<p class="ds-empty">Loading community schedules&hellip;</p>';
+    apiGet('/api/profiles/remote', function(resp) {
+        remote_profiles_loaded = true;
+        if (!resp || !resp.success) {
+            list.innerHTML = '<p class="ds-empty">' + (resp && resp.error ? resp.error : 'Could not load community schedules.') + '</p>';
+            return;
+        }
+        upload_enabled = resp.upload_enabled;
+        var shareRow = $('share_profile_row');
+        if (shareRow) { shareRow.style.display = upload_enabled ? '' : 'none'; }
+        populateShareCategories(resp.categories);
+        remote_profiles = resp.profiles || [];
+        renderRemoteProfiles();
+    });
+}
+
+function escHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function remoteFilterMatches(p, query) {
+    if (!query) { return true; }
+    var q = query.toLowerCase();
+    var hay = (p.name + ' ' + p.category + ' '
+        + (p.tags || []).join(' ') + ' '
+        + (p.description || '')).toLowerCase();
+    return hay.indexOf(q) !== -1;
+}
+
+function applyRemoteFilter() {
+    renderRemoteProfiles();
+}
+
+function renderRemoteProfiles() {
+    var list = $('remote_profiles_list');
+    if (!list) { return; }
+    var filter = $('remote_filter_input');
+    var query = filter ? filter.value.trim() : '';
+    var html = '';
+    var shown = 0;
+    if (remote_profiles.length === 0) {
+        html = '<p class="ds-empty">No profiles shared yet. Be the first!</p>';
+    }
+    for (var i = 0; i < remote_profiles.length; i++) {
+        var p = remote_profiles[i];
+        if (!remoteFilterMatches(p, query)) { continue; }
+        shown++;
+        var tags = (p.tags || []).slice(0, 6).map(function(t) {
+            return '<span class="badge text-bg-light border">' + escHtml(t) + '</span>';
+        }).join(' ');
+        html += '<div class="profile-row">'
+            + '<div class="profile-info">'
+            + '<div class="profile-name">' + escHtml(p.name)
+            + ' <span class="badge text-bg-secondary">' + escHtml(p.category) + '</span>'
+            + (p.installed ? ' <span class="badge text-bg-success">installed</span>' : '') + '</div>'
+            + '<div class="profile-meta">community schedule'
+            + (p.units ? ' &middot; ' + escHtml(p.units) : '')
+            + (p.description ? ' &middot; ' + escHtml(p.description) : '') + '</div>'
+            + (tags ? '<div class="profile-tags">' + tags + '</div>' : '')
+            + '</div>'
+            + '<div class="btn-group">'
+            + (p.installed
+                ? '<button type="button" class="btn btn-outline-secondary btn-sm" onclick="importRemoteProfile(\'' + p.path + '\')"><i class="bi bi-arrow-repeat"></i> Re-install</button>'
+                : '<button type="button" class="btn btn-success btn-sm" onclick="importRemoteProfile(\'' + p.path + '\')"><i class="bi bi-download"></i> Install</button>')
+            + '</div>'
+            + '</div>';
+    }
+    if (remote_profiles.length > 0 && shown === 0) {
+        html = '<p class="ds-empty">No community schedules match &ldquo;' + escHtml(query) + '&rdquo;.</p>';
+    }
+    list.innerHTML = html;
+}
+
+function populateShareCategories(categories) {
+    var sel = $('form_share_category');
+    if (!sel || !categories || categories.length === 0) { return; }
+    var html = '';
+    for (var i = 0; i < categories.length; i++) {
+        html += '<option value="' + categories[i] + '">' + categories[i] + '</option>';
+    }
+    sel.innerHTML = html;
+}
+
+function importRemoteProfile(path) {
+    fetch('/api/profiles/remote/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: path })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(resp) {
+        if (resp.success) {
+            showGrowl('Installed <b>' + resp.name + '</b> from the community repo', 'success', 5000);
+            remote_profiles_loaded = false;
+            ws_storage.send('GET');
+            loadRemoteProfiles(true);
+            renderProfiles();
+        } else {
+            showGrowl('ERROR 97:<br/>' + (resp.error || 'Could not install profile.'), 'error', 5000);
+        }
+    })
+    .catch(function(err) {
+        showGrowl('ERROR 98:<br/>' + err, 'error', 5000);
+    });
+}
+
+function shareProfile() {
+    var name = slugifyProfileName($('form_profile_name').value);
+    if (!name) {
+        showGrowl('ERROR 99:<br/>Enter a schedule name first.', 'error', 5000);
+        return;
+    }
+    $('form_profile_name').value = name;
+    if (!graph.profile.data || graph.profile.data.length < 2) {
+        showGrowl('ERROR 99:<br/>A schedule needs at least two points to share.', 'error', 5000);
+        return;
+    }
+    var tokenInput = $('form_share_token');
+    if (tokenInput && !tokenInput.value) {
+        try { tokenInput.value = localStorage.getItem('kiln_share_token') || ''; } catch (e) {}
+    }
+    var token = tokenInput ? tokenInput.value.trim() : '';
+    if (token) {
+        try { localStorage.setItem('kiln_share_token', token); } catch (e) {}
+    }
+    var profile = {
+        "type": "profile",
+        "name": name,
+        "data": graph.profile.data,
+        "temp_units": temp_scale,
+        "description": $('form_profile_description').value || ''
+    };
+    var category = $('form_share_category').value || 'pottery';
+    fetch('/api/profiles/remote/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ category: category, profile: profile, github_token: token })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(resp) {
+        if (resp.success) {
+            var msg = 'Submitted <b>' + resp.name + '</b> as a community pull request';
+            if (resp.pr_url) { msg += ' &middot; <a href="' + resp.pr_url + '" target="_blank" rel="noopener">view PR</a>'; }
+            showGrowl(msg, 'success', 8000);
+            remote_profiles_loaded = false;
+            ws_storage.send('GET');
+            renderProfiles();
+        } else {
+            showGrowl('ERROR 97:<br/>' + (resp.error || 'Could not share profile.'), 'error', 8000);
+        }
+    })
+    .catch(function(err) {
+        showGrowl('ERROR 98:<br/>' + err, 'error', 5000);
+    });
+}
+
+function pad2(n) {
+    return n < 10 ? '0' + n : '' + n;
+}
+
+function saveConfig() {
+    var btn = $('btn_save_config');
+    btn.disabled = true;
+    fetch('/api/config/editor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: $('config_editor').value })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(resp) {
+        if (resp.success) {
+            if (resp.restart_scheduled) {
+                showGrowl('config.py saved. Restarting controller to load all settings... the page will reconnect in a few seconds.', 'success', 8000);
+            } else {
+                showGrowl('config.py saved and reloaded.', 'success', 5000);
+                if (resp.warning) {
+                    showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> ' + resp.warning, 'error', 8000);
+                }
+            }
+        } else {
+            showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 96:</b><br/>' + (resp.error || 'Could not save config.py.'), 'error', 8000);
+        }
+    })
+    .catch(function(err) {
+        showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 97:</b><br/>' + err, 'error', 8000);
+    })
+    .then(function() {
+        btn.disabled = false;
+    });
+}
+
+function loadConfigEditor() {
+    fetch('/api/config/editor')
+    .then(function(r) {
+        if (!r.ok) {
+            throw new Error('HTTP ' + r.status);
+        }
+        return r.text();
+    })
+    .then(function(text) {
+        $('config_editor').value = text;
+    })
+    .catch(function(err) {
+        showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 95:</b><br/>Could not load config.py: ' + err, 'error', 5000);
+    });
+}
+
+/* ---------------------------------------------------------------------------
+   Alerts panel
+--------------------------------------------------------------------------- */
+
+var ALERT_TIER_LABELS = {
+    critical: 'Critical',
+    warning: 'Warning',
+    info: 'Info'
+};
+
+// pure so it can be unit tested: builds the panel body from the api
+// payload, grouping alerts under criticality headings, highest first,
+// then the delivery settings (mqtt / webhook).
+function renderAlertsHtml(alerts, delivery, mqttConfigured) {
+    var tiers = {};
+    var order = ['critical', 'warning', 'info'];
+    for (var i = 0; i < alerts.length; i++) {
+        var alert = alerts[i];
+        if (!tiers[alert.criticality]) { tiers[alert.criticality] = []; }
+        tiers[alert.criticality].push(alert);
+    }
+    var html = '';
+    for (var t = 0; t < order.length; t++) {
+        var tier = order[t];
+        var rows = tiers[tier];
+        if (!rows || !rows.length) { continue; }
+        html += '<div class="alert-tier small text-muted text-uppercase fw-bold mt-2 mb-1">' +
+            escHtml(ALERT_TIER_LABELS[tier] || tier) + '</div>';
+        for (var r = 0; r < rows.length; r++) {
+            var a = rows[r];
+            html += '<div class="form-check form-switch py-1">' +
+                '<input class="form-check-input" type="checkbox" role="switch" id="alert_' + escHtml(a.id) + '"' +
+                (a.enabled ? ' checked' : '') +
+                ' onchange="toggleAlert(\'' + escHtml(a.id) + '\', this)" />' +
+                '<label class="form-check-label" for="alert_' + escHtml(a.id) + '">' +
+                escHtml(a.label) +
+                '<div class="small text-muted">' + escHtml(a.description) + '</div>' +
+                '</label></div>';
+        }
+    }
+    return html + renderDeliveryHtml(delivery, mqttConfigured);
+}
+
+// pure: the delivery part of the panel. toggles save immediately like
+// the alert switches; text fields save when edited.
+function renderDeliveryHtml(delivery, mqttConfigured) {
+    delivery = delivery || {};
+    var mqttOn = delivery.mqtt_enabled === true;
+    var webhookOn = delivery.webhook_enabled === true;
+    var html = '<div class="alert-tier small text-muted text-uppercase fw-bold mt-3 mb-1">Delivery</div>' +
+        '<p class="small text-muted mb-2">Where fired alerts go beyond the daemon log. Changes take effect immediately.</p>';
+
+    html += '<div class="form-check form-switch py-1">' +
+        '<input class="form-check-input" type="checkbox" role="switch" id="delivery_mqtt"' +
+        (mqttOn ? ' checked' : '') +
+        ' onchange="toggleDelivery(\'mqtt_enabled\', this)" />' +
+        '<label class="form-check-label" for="delivery_mqtt">Send alerts over MQTT' +
+        (!mqttConfigured ?
+            '<div class="small text-muted">The mqtt broker is not configured in config.py (mqtt_enable).</div>'
+            : '<div class="small text-muted">Published as json on their own topic, next to the live state stream.</div>') +
+        '</label></div>';
+    html += '<div class="mb-2 ps-4">' +
+        '<label class="form-label small mb-1" for="delivery_mqtt_topic">Topic</label>' +
+        '<input type="text" class="form-control form-control-sm" id="delivery_mqtt_topic" ' +
+        'value="' + escHtml(delivery.mqtt_topic || '') + '" spellcheck="false" ' +
+        'onchange="saveDeliveryField(\'mqtt_topic\', this)" /></div>';
+
+    html += '<div class="form-check form-switch py-1">' +
+        '<input class="form-check-input" type="checkbox" role="switch" id="delivery_webhook"' +
+        (webhookOn ? ' checked' : '') +
+        ' onchange="toggleDelivery(\'webhook_enabled\', this)" />' +
+        '<label class="form-check-label" for="delivery_webhook">Post alerts to a webhook' +
+        '<div class="small text-muted">Any url that accepts json posts: ntfy, discord, slack, home assistant&hellip;</div>' +
+        '</label></div>';
+    html += '<div class="mb-2 ps-4">' +
+        '<label class="form-label small mb-1" for="delivery_webhook_url">Webhook URL</label>' +
+        '<input type="text" class="form-control form-control-sm" id="delivery_webhook_url" ' +
+        'value="' + escHtml(delivery.webhook_url || '') + '" placeholder="https://ntfy.sh/my-kiln" spellcheck="false" ' +
+        'onchange="saveDeliveryField(\'webhook_url\', this)" /></div>';
+    return html;
+}
+
+function loadAlerts() {
+    fetch('/api/alerts')
+    .then(function(r) {
+        if (!r.ok) {
+            throw new Error('HTTP ' + r.status);
+        }
+        return r.json();
+    })
+    .then(function(resp) {
+        if (!resp.success) {
+            throw new Error(resp.error || 'unknown error');
+        }
+        $('alerts_list').innerHTML = renderAlertsHtml(resp.alerts,
+                                                      resp.delivery,
+                                                      resp.mqtt_configured);
+    })
+    .catch(function(err) {
+        showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 89:</b><br/>Could not load alerts: ' + err, 'error', 5000);
+    });
+}
+
+function toggleAlert(id, checkbox) {
+    var wanted = checkbox.checked;
+    var updates = {};
+    updates[id] = wanted;
+    fetch('/api/alerts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: updates })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(resp) {
+        if (!resp.success) {
+            throw new Error(resp.error || 'unknown error');
+        }
+    })
+    .catch(function(err) {
+        // revert the switch so the ui does not lie about saved state
+        checkbox.checked = !wanted;
+        showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 87:</b><br/>Could not save alert change: ' + err, 'error', 5000);
+    });
+}
+
+// delivery toggles: same instant-save + revert-on-failure contract as
+// the alert switches
+function toggleDelivery(field, checkbox) {
+    var wanted = checkbox.checked;
+    var update = {};
+    update[field] = wanted;
+    postDelivery(update, function(err) {
+        if (err) {
+            checkbox.checked = !wanted;
+            showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 87:</b><br/>Could not save delivery change: ' + err, 'error', 5000);
+        }
+    });
+}
+
+// delivery text fields (topic, webhook url): saved when edited. on
+// failure the input reverts to the value it had before the edit.
+function saveDeliveryField(field, input) {
+    var wanted = input.value;
+    var previous = input.defaultValue;
+    var update = {};
+    update[field] = wanted;
+    postDelivery(update, function(err, resp) {
+        if (err) {
+            input.value = previous;
+            showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 87:</b><br/>Could not save delivery change: ' + err, 'error', 5000);
+        } else if (resp && resp.delivery) {
+            // keep defaultValue in sync with what the server accepted
+            input.defaultValue = resp.delivery[field];
+        }
+    });
+}
+
+function postDelivery(update, cb) {
+    fetch('/api/alerts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ delivery: update })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(resp) {
+        if (!resp.success) {
+            throw new Error(resp.error || 'unknown error');
+        }
+        cb(null, resp);
+    })
+    .catch(function(err) {
+        cb(err);
+    });
+}
+
+/* ---------------------------------------------------------------------------
+   PID Auto-Tuner
+--------------------------------------------------------------------------- */
+
+var tuner_poll_timer = null;
+
+function tunerPost(obj, cb) {
+    fetch('/api/tune', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(obj)
+    })
+    .then(function(r) { return r.json(); })
+    .then(cb)
+    .catch(function(err) {
+        showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> API error: ' + err, 'error', 5000);
+    });
+}
+
+function startTuner() {
+    var target = $('tuner_target_temp').value;
+    var method = $('tuner_method').value;
+    var divisor = $('tuner_tangent_divisor').value;
+
+    tunerPost({cmd: 'start', target_temp: parseFloat(target), method: method, tangent_divisor: parseFloat(divisor)}, function(resp) {
+        if (resp.success) {
+            $('btn_tuner_start').style.display = 'none';
+            $('btn_tuner_stop').style.display = '';
+            $('tuner_status').style.display = '';
+            $('tuner_results').style.display = 'none';
+            $('tuner_error').style.display = 'none';
+            $('tuner_status_text').innerHTML = 'Starting tuning...';
+            tuner_poll();
+            tuner_poll_timer = setInterval(tuner_poll, 3000);
+        } else {
+            showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> ' + (resp.error || 'Could not start tuner'), 'error', 5000);
+        }
+    });
+}
+
+function stopTuner() {
+    tunerPost({cmd: 'stop'}, function(resp) {
+        tuner_poll();
+    });
+}
+
+function tuner_poll() {
+    tunerPost({cmd: 'status'}, function(resp) {
+        if (!resp || !resp.success) return;
+
+        if (resp.state === 'DONE') {
+            clearInterval(tuner_poll_timer);
+            tuner_poll_timer = null;
+            $('btn_tuner_stop').style.display = 'none';
+            $('btn_tuner_start').style.display = '';
+            $('tuner_status').style.display = 'none';
+            $('tuner_results').style.display = '';
+            $('tuner_error').style.display = 'none';
+            if (resp.pid_values) {
+                $('tuner_pid_values').innerHTML =
+                    'pid_kp = ' + resp.pid_values.kp + '\n' +
+                    'pid_ki = ' + resp.pid_values.ki + '\n' +
+                    'pid_kd = ' + resp.pid_values.kd;
+            }
+            showGrowl('Tuning complete. PID values applied.', 'success', 5000);
+            return;
+        }
+
+        if (resp.state === 'ERROR') {
+            clearInterval(tuner_poll_timer);
+            tuner_poll_timer = null;
+            $('btn_tuner_stop').style.display = 'none';
+            $('btn_tuner_start').style.display = '';
+            $('tuner_status').style.display = 'none';
+            $('tuner_results').style.display = 'none';
+            $('tuner_error').style.display = '';
+            $('tuner_error_text').innerHTML = '<i class="bi bi-exclamation-triangle-fill"></i> ' + (resp.error || 'Tuning failed');
+            return;
+        }
+
+        // still running -- update status text
+        var phase = resp.phase || resp.state || 'working';
+        var phaseLabel = phase.charAt(0).toUpperCase() + phase.slice(1);
+        var temp = resp.temperature != null ? rnd(resp.temperature) : '--';
+        var target = resp.target != null ? rnd(resp.target) : '--';
+        var tunerElapsed = formatDuration(resp.elapsed || 0);
+        var points = resp.data_points || 0;
+        var msg = '';
+        if (phase === 'heating') {
+            msg = '<i class="bi bi-fire"></i> <strong>Heating</strong> &mdash; ramping to ' + target + ' &deg; &middot; ' + temp + ' &deg; &middot; elapsed ' + tunerElapsed + ' &middot; ' + points + ' data points';
+        } else if (phase === 'cooling') {
+            msg = '<i class="bi bi-snow"></i> <strong>Cooling</strong> &mdash; dropping to ' + target + ' &deg; &middot; ' + temp + ' &deg; &middot; elapsed ' + tunerElapsed + ' &middot; ' + points + ' data points';
+        } else {
+            msg = '<strong>' + escHtml(phaseLabel) + '</strong> &middot; Temp: ' + temp + ' &middot; Target: ' + target + ' &middot; Elapsed: ' + tunerElapsed + ' &middot; Points: ' + points;
+        }
+        $('tuner_status_text').innerHTML = msg;
+    });
+}
+
+function isoLocal(d) {
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' +
+        pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+
+function scheduleProfile(i) {
+    if (!profiles.length || !profiles[i]) {
+        showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 93:</b><br/>No schedule selected.', 'error', 5000);
+        return;
+    }
+    selected_profile = i;
+    $('schedule_profile_name').innerHTML = profiles[i].name;
+    $('schedule_datetime').value = isoLocal(new Date(Date.now() + 60 * 60 * 1000));
+    clearScheduleChain();
+    renderScheduleAfterList();
+    var modal = new bootstrap.Modal($('scheduleModal'));
+    modal.show();
+}
+
+function setScheduleOffset(minutes) {
+    $('schedule_datetime').value = isoLocal(new Date(Date.now() + minutes * 60 * 1000));
+    clearScheduleChain();
+}
+
+function submitSchedule() {
+    var dt = $('schedule_datetime').value;
+    if (!dt) {
+        showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 90:</b><br/>Please pick a date and time.', 'error', 5000);
+        return;
+    }
+    var body = {
+        cmd: 'schedule',
+        profile: profiles[selected_profile].name,
+        start_time: dt
+    };
+    var chain = $('schedule_chain_after') ? $('schedule_chain_after').value : '';
+    if (chain) { body.chain_after = chain; }
+    apiPost(body, function(resp) {
+        if (resp.success) {
+            showGrowl('Firing scheduled for <b>' + new Date(resp.start_time * 1000).toLocaleString() + '</b>', 'success', 5000);
+            var modal = bootstrap.Modal.getInstance($('scheduleModal'));
+            if (modal) { modal.hide(); }
+            listScheduledRuns();
+        } else {
+            showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 91:</b><br/>' + (resp.error || 'Could not schedule firing.'), 'error', 5000);
+        }
+    });
+}
+
+function scheduleTime(entry) {
+    return new Date(entry.start_time * 1000).toLocaleString();
+}
+
+// a firing chained after another starts this many seconds after the firing
+// it follows actually ends. the backend applies this; the field below only
+// shows the estimate (the real end may move when the kiln catches up).
+var SCHEDULE_CHAIN_BUFFER = 60;
+
+function profileDurationSeconds(name) {
+    for (var i = 0; i < profiles.length; i++) {
+        if (profiles[i].name === name && profiles[i].data && profiles[i].data.length > 0) {
+            return parseInt(profiles[i].data[profiles[i].data.length - 1][0]);
+        }
+    }
+    return 0;
+}
+
+function scheduleAfter(epoch, chain) {
+    var el = $('schedule_datetime');
+    if (!el) { return; }
+    el.value = isoLocal(new Date(epoch * 1000));
+    var hidden = $('schedule_chain_after');
+    var note = $('schedule_chain_note');
+    if (hidden) { hidden.value = chain || ''; }
+    if (note) { note.style.display = chain ? '' : 'none'; }
+}
+
+function clearScheduleChain() {
+    var hidden = $('schedule_chain_after');
+    var note = $('schedule_chain_note');
+    if (hidden) { hidden.value = ''; }
+    if (note) { note.style.display = 'none'; }
+}
+
+function renderScheduleAfterList() {
+    var container = $('schedule_after');
+    var list = $('schedule_after_list');
+    if (!container || !list) { return; }
+
+    var now = Date.now() / 1000;
+    var items = [];
+
+    // the firing currently in progress, if any. runtime advances with the
+    // wall clock, so the finish epoch captured now stays accurate even if
+    // the dialog sits open for a while. this is only the estimate; the
+    // actual start is governed by the backend once the run really ends.
+    var st = oven_status;
+    if (st && (st.state === "RUNNING" || st.state === "PAUSED") && st.profile) {
+        var finish_in = Math.max(0, (st.totaltime || 0) - (st.runtime || 0));
+        items.push({
+            name: typeof st.profile == 'object' ? st.profile.name : st.profile,
+            badge: st.state === "PAUSED" ? 'paused' : 'running',
+            finish_epoch: now + finish_in,
+            finish_in: finish_in,
+            chain_after: 'run:' + (st.run_id || 0)
+        });
+    }
+
+    apiPost({ cmd: 'list_schedules' }, function(resp) {
+        var runs = (resp && resp.schedules) ? resp.schedules.filter(function(r) {
+            return !r.fired && r.start_time > now;
+        }) : [];
+        for (var i = 0; i < runs.length; i++) {
+            var dur = profileDurationSeconds(runs[i].profile);
+            if (dur <= 0) { continue; }
+            var consumed = Math.max(0, dur - (runs[i].startat || 0) * 60);
+            var finish_epoch = runs[i].start_time + consumed;
+            items.push({
+                name: runs[i].profile,
+                badge: 'scheduled',
+                finish_epoch: finish_epoch,
+                finish_in: finish_epoch - now,
+                chain_after: 'sched:' + runs[i].id
+            });
+        }
+
+        items.sort(function(a, b) { return a.finish_epoch - b.finish_epoch; });
+
+        if (items.length === 0) {
+            container.style.display = 'none';
+            list.innerHTML = '';
+            return;
+        }
+
+        var html = '';
+        for (var j = 0; j < items.length; j++) {
+            var it = items[j];
+            var badgeClass = it.badge === 'running' ? 'text-bg-danger'
+                : it.badge === 'paused' ? 'text-bg-warning' : 'text-bg-secondary';
+            var when = new Date(it.finish_epoch * 1000).toLocaleString();
+            html += '<div class="profile-row">'
+                + '<div class="profile-info">'
+                + '<div class="profile-name">' + escHtml(it.name)
+                + ' <span class="badge ' + badgeClass + '">' + it.badge + '</span></div>'
+                + '<div class="profile-meta">finishes in ~' + formatDuration(it.finish_in)
+                + ' &middot; ' + when + ' (est.)</div>'
+                + '</div>'
+                + '<div class="btn-group">'
+                + '<button type="button" class="btn btn-outline-secondary btn-sm" onclick="scheduleAfter('
+                + (it.finish_epoch + SCHEDULE_CHAIN_BUFFER) + ', \'' + it.chain_after + '\')">After this</button>'
+                + '</div>'
+                + '</div>';
+        }
+        list.innerHTML = html;
+        container.style.display = '';
+    });
+}
+
+function formatDuration(secs) {
+    secs = Math.max(0, Math.floor(secs));
+    var d = Math.floor(secs / 86400);
+    var h = Math.floor((secs % 86400) / 3600);
+    var m = Math.floor((secs % 3600) / 60);
+    var s = secs % 60;
+    function pad(n) { return (n < 10 ? '0' : '') + n; }
+    var hms = pad(h) + ':' + pad(m) + ':' + pad(s);
+    return d > 0 ? d + ' ' + hms : hms;
+}
+
+function formatCountdown(secs) {
+    return formatDuration(secs);
+}
+
+var pending_schedules = [];
+var schedule_timer = null;
+
+function scheduleRunBadge(r) {
+    if (r.status === 'waiting') { return 'waiting'; }
+    if (r.chain_after) { return 'queued'; }
+    return 'pending';
+}
+
+function scheduleCountdownText(r, now) {
+    // a chained firing starts after the firing it follows actually ends
+    // (catch-up can stretch that past the estimate), so its start_time
+    // is only an estimate and must never count down like a fixed time.
+    if (r.chain_after) { return 'waiting for previous firing'; }
+    return r.start_time - now > 0 ? formatCountdown(r.start_time - now) : 'starting...';
+}
+
+function scheduleMetaText(r) {
+    if (r.chain_after) {
+        return 'After the previous run finishes.';
+    }
+    return 'Starts ' + scheduleTime(r);
+}
+
+function startScheduleTimer() {
+    if (schedule_timer) { return; }
+    schedule_timer = setInterval(function() {
+        if (pending_schedules.length === 0) { return; }
+        var now = Date.now() / 1000;
+        for (var i = 0; i < pending_schedules.length; i++) {
+            var r = pending_schedules[i];
+            var el = document.getElementById('schedule-countdown-' + r.id);
+            if (el) {
+                el.textContent = scheduleCountdownText(r, now);
+            }
+        }
+    }, 1000);
+}
+
+function listScheduledRuns() {
+    var list = $('scheduled_runs_list');
+    if (!list) { return; }
+    apiPost({ cmd: 'list_schedules' }, function(resp) {
+        var runs = (resp && resp.schedules) ? resp.schedules.filter(function(r) { return !r.fired; }) : [];
+        if (runs.length === 0) {
+            list.innerHTML = '<p class="ds-empty">No runs scheduled.</p>';
+            pending_schedules = [];
+            return;
+        }
+        pending_schedules = runs;
+        startScheduleTimer();
+        var html = '';
+        for (var i = 0; i < runs.length; i++) {
+            var r = runs[i];
+            var now = Date.now() / 1000;
+            var meta = r.chain_after
+                ? scheduleMetaText(r)
+                : scheduleMetaText(r) + ' &middot; <span id="schedule-countdown-' + r.id + '">' + scheduleCountdownText(r, now) + '</span>';
+            html += '<div class="profile-row">'
+                + '<div class="profile-info">'
+                + '<div class="profile-name">' + r.profile + ' <span class="badge text-bg-primary">' + scheduleRunBadge(r) + '</span></div>'
+                + '<div class="profile-meta">' + meta + '</div>'
+                + '</div>'
+                + '<div class="btn-group">'
+                + '<button type="button" class="btn btn-outline-danger btn-sm" onclick="cancelSchedule(\'' + r.id + '\')"><i class="bi bi-x-lg"></i> Cancel</button>'
+                + '</div></div>';
+        }
+        list.innerHTML = html;
+    });
+}
+
+function cancelSchedule(id) {
+    apiPost({ cmd: 'cancel_schedule', id: id }, function(resp) {
+        if (resp.success) {
+            showGrowl('Scheduled run cancelled.', 'success', 5000);
+        } else {
+            showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 92:</b><br/>' + (resp.error || 'Could not cancel schedule.'), 'error', 5000);
+        }
+        listScheduledRuns();
+    });
+}
+
+function profileDuration(data) {
+    var secs = 0;
+    if (data.length > 0) {
+        secs = parseInt(data[data.length-1][0]);
+    }
+    return formatDuration(secs);
+}
+
+function renderProfiles()
+{
+    var list = $('profiles_list');
+    if (!list) { return; }
+    var html = '';
+    if (profiles.length === 0) {
+        html = '<p class="ds-empty">No schedules saved yet. Create one with <i class="bi bi-file-earmark-plus"></i> New Schedule.</p>';
+    }
+    for (var i = 0; i < profiles.length; i++) {
+        var p = profiles[i];
+        var current = (p.name === selected_profile_name);
+        var running = (p.name === running_profile_name);
+        html += '<div class="profile-row">'
+            + '<div class="profile-info">'
+            + '<div class="profile-name">' + p.name
+            + (running ? ' <span class="badge text-bg-danger">running</span>' : '')
+            + (current ? ' <span class="badge text-bg-success">selected</span>' : '') + '</div>'
+            + '<div class="profile-meta">' + p.data.length + ' points &middot; duration ' + profileDuration(p.data) + '</div>'
+            + '</div>'
+            // while this profile runs its row carries the only stop
+            // control in the ui, so edit and delete are hidden: deleting
+            // the row would leave an active firing unstoppable until it
+            // finishes. both buttons come back once the run ends.
+            + '<div class="btn-group">'
+            + (running
+                ? '<button type="button" class="btn btn-danger btn-sm" onclick="abortTask()"><i class="bi bi-stop-fill"></i> Stop</button>'
+                : '<button type="button" class="btn btn-success btn-sm" onclick="selectProfile(' + i + ', true)"><i class="bi bi-play-fill"></i> Run</button>')
+            + '<button type="button" class="btn btn-outline-secondary btn-sm" onclick="scheduleProfile(' + i + ')"><i class="bi bi-calendar-plus"></i> Schedule</button>'
+            + (running ? ''
+                : '<button type="button" class="btn btn-outline-secondary btn-sm" onclick="editProfile(' + i + ')"><i class="bi bi-pencil"></i> Edit</button>'
+                + '<button type="button" class="btn btn-outline-secondary btn-sm" onclick="selectProfile(' + i + ', null)"><i class="bi bi-trash"></i> Delete</button>')
+            + '</div>'
+            + '</div>';
+    }
+    list.innerHTML = html;
+    listScheduledRuns();
+}
+
+function selectProfile(i, run)
+{
+    selected_profile = i;
+    updateProfile(i);
+    renderProfiles();
+    if (run === true) {
+        runTask();
+    } else if (run === false) {
+        editProfile(i);
+    } else {
+        var d = new bootstrap.Modal($('delProfileModal'));
+        d.show();
+    }
+}
+
+function editProfile(i)
+{
+    enterEditMode(i);
+}
+
+/* ---------------------------------------------------------------------------
+   Tuning
+--------------------------------------------------------------------------- */
+
+function rnd(number) {
+  return Number(number).toFixed(2);
+}
+
+function average(field, minutes, data) {
+  if (data.length === 0) {
+    return 0;
+  }
+  var t = data[data.length - 1].time;
+  var oldest = t - (60 * minutes);
+  var sum = 0;
+  var count = 0;
+  for (var i = 0; i < data.length; i++) {
+    if (data[i].time >= oldest) {
+      sum += data[i][field];
+      count++;
+    }
+  }
+  return count ? sum / count : 0;
+}
+
+function percent_catching_up(data) {
+  var slip = 0;
+  var total = 0;
+  for (var i = 0; i < data.length; i++) {
+    var d = data[i];
+    total += d.timeDelta;
+    if (d.catching_up) {
+      slip += d.timeDelta;
+    }
+  }
+  return total ? slip / total * 100 : 0;
+}
+
+// pure: seconds spent catching up (schedule shifted waiting for the
+// kiln), for the TIME box on the details tab. the CATCH UP box shows
+// the same slip as a percentage.
+function catching_up_seconds(data) {
+  var slip = 0;
+  for (var i = 0; i < data.length; i++) {
+    if (data[i].catching_up) {
+      slip += data[i].timeDelta || 0;
+    }
+  }
+  return slip;
+}
+
+function clock_tick(val) {
+  return new Date(val * 1000).toLocaleTimeString([], { hour12: false });
+}
+
+function make_line_chart(id) {
+  var tc = themeColors();
+  return new Chart($(id), {
+    type: 'line',
+    data: { datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: 'nearest', intersect: false },
+      plugins: {
+        legend: { position: 'top', labels: { boxWidth: 12, font: { size: 11 }, color: tc.axis } },
+        tooltip: {
+          enabled: true,
+          callbacks: {
+            title: function(items) {
+              if (items.length > 0) { return unix_to_yymmdd_hhmmss(items[0].parsed.x); }
+              return '';
+            },
+            label: function(context) {
+              return context.dataset.label + ': ' + context.parsed.y;
+            }
+          }
+        },
+        dragData: false
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          ticks: { maxTicksLimit: 8, maxRotation: 0, callback: clock_tick, color: tc.axisDim },
+          grid: { color: tc.gridDim }
+        },
+        y: {
+          ticks: { color: tc.axisDim },
+          grid: { color: tc.gridDim }
+        }
+      }
+    }
+  });
+}
+
+function create_charts() {
+  var tc = themeColors();
+  charts.temps = make_line_chart('chart-temps');
+  charts.temps.data.datasets = [
+    {
+      label: 'target',
+      data: [],
+      dragData: false,
+      order: 2,
+      borderColor: '#9cb310',
+      backgroundColor: '#9cb310',
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0
+    },
+    {
+      label: 'temp',
+      data: [],
+      dragData: false,
+      order: 1,
+      borderColor: tc.live,
+      backgroundColor: tc.live,
+      borderWidth: 2,
+      pointRadius: 0,
+      tension: 0
+    },
+    {
+      label: 'catchup',
+      type: 'scatter',
+      data: [],
+      dragData: false,
+      order: 3,
+      showLine: false,
+      pointRadius: 3,
+      pointBackgroundColor: '#6ec6ff'
+    }
+  ];
+
+  charts.error = make_line_chart('chart-error');
+  charts.error.data.datasets = [line_dataset('error', '#ff8a80')];
+
+  charts.temperrors = make_line_chart('chart-temp-errors');
+  charts.temperrors.data.datasets = [line_dataset('read errors', '#ff8a80')];
+
+  charts.heat = make_line_chart('chart-heat');
+  charts.heat.data.datasets = [line_dataset('heat', '#ffb14e')];
+
+  charts.heatrate = make_line_chart('chart-heat-rate');
+  charts.heatrate.data.datasets = [line_dataset('heat rate', '#ffb14e')];
+
+  charts.p = make_line_chart('chart-p');
+  charts.p.data.datasets = [line_dataset('p', '#6ec6ff')];
+
+  charts.i = make_line_chart('chart-i');
+  charts.i.data.datasets = [line_dataset('i', '#6ec6ff')];
+
+  charts.d = make_line_chart('chart-d');
+  charts.d.data.datasets = [line_dataset('d', '#6ec6ff')];
+
+  applyChartTheme();
+}
+
+function line_dataset(name, color) {
+  return {
+    label: name,
+    data: [],
+    dragData: false,
+    borderColor: color,
+    backgroundColor: color,
+    borderWidth: 2,
+    pointRadius: 0,
+    tension: 0
+  };
+}
+
+function set_chart_data(chart, rows, key) {
+  var data = [];
+  for (var i = 0; i < rows.length; i++) {
+    data.push({ x: rows[i].time, y: rows[i][key] });
+  }
+  chart.data.datasets[0].data = data;
+  chart.update('none');
+}
+
+// rates are derived between consecutive samples and reported in
+// degrees/hour to match how firing schedules specify ramp rates; a gap
+// larger than this (reconnects, pruned history) says nothing about the
+// current slope
+var RATE_MAX_GAP = 15;
+
+function rate_series(data, field) {
+  var out = [];
+  var i;
+  for (i = 1; i < data.length; i++) {
+    var dt = data[i].time - data[i - 1].time;
+    if (dt > 0 && dt <= RATE_MAX_GAP) {
+      out.push({ x: data[i].time, y: (data[i][field] - data[i - 1][field]) / dt * 3600 });
+    }
+  }
+  return out;
+}
+
+function drawall(data) {
+  draw_temps(data);
+  draw_error(data);
+  draw_heat(data);
+  draw_heat_rate(data);
+  draw_p(data);
+  draw_i(data);
+  draw_d(data);
+  draw_temp_errors(data);
+}
+
+function draw_temps(data) {
+  var i;
+  var setpoint = [];
+  var ispoint = [];
+  var catchup = [];
+  for (i = 0; i < data.length; i++) {
+    var d = data[i];
+    setpoint.push({ x: d.time, y: d.setpoint });
+    ispoint.push({ x: d.time, y: d.ispoint });
+    if (d.catchingup !== null && d.catchingup !== undefined) {
+      catchup.push({ x: d.time, y: d.catchingup });
+    }
+  }
+  charts.temps.data.datasets[0].data = setpoint;
+  charts.temps.data.datasets[1].data = ispoint;
+  charts.temps.data.datasets[2].data = catchup;
+  charts.temps.update('none');
+}
+
+function draw_error(data) {
+  set_chart_data(charts.error, data, 'err');
+}
+
+function draw_temp_errors(data) {
+  set_chart_data(charts.temperrors, data, 'temp_errors');
+}
+
+function draw_heat(data) {
+  set_chart_data(charts.heat, data, 'out');
+}
+
+function draw_heat_rate(data) {
+  var pts = rate_series(data, 'ispoint');
+  charts.heatrate.data.datasets[0].data = pts;
+  charts.heatrate.update('none');
+}
+
+function draw_p(data) {
+  set_chart_data(charts.p, data, 'p');
+}
+
+function draw_i(data) {
+  set_chart_data(charts.i, data, 'i');
+}
+
+function draw_d(data) {
+  set_chart_data(charts.d, data, 'd');
+}
+
+function unix_to_yymmdd_hhmmss(t) {
+  var date = new Date(t * 1000);
+  var newd = new Date(date.getTime() - date.getTimezoneOffset()*60000);
+  return newd.toISOString().replace("T"," ").substring(0, 19);
+}
+
+var window_minutes = 2;
+var window_all = true;
+
+function windowed_data() {
+  if (window_all || all.length === 0) { return all; }
+  var last = all[all.length - 1].time;
+  var cutoff = last - window_minutes * 60;
+  var out = [];
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].time >= cutoff) { out.push(all[i]); }
+  }
+  return out;
+}
+
+function tune_window_change() {
+  var slider = document.getElementById('window_slider');
+  var v = parseInt(slider.value, 10);
+  var max = parseInt(slider.max, 10);
+  var label = document.getElementById('window_label');
+  if (v >= max) {
+    window_all = true;
+    label.innerHTML = 'All';
+  } else {
+    window_all = false;
+    window_minutes = v;
+    label.innerHTML = v + ' min';
+  }
+  drawall(windowed_data());
+}
+
+function download_dump() {
+  showGrowl('<i class="bi bi-download"></i> Building config dump&hellip; this can take a few minutes.', 'success', 5000);
+  fetch('/api/dump')
+    .then(function(r) {
+      if (r.ok) { return r.blob(); }
+      // dump refused (e.g. a firing is active) -- surface the reason
+      return r.json().then(function(err) {
+        throw new Error((err && err.error) || ('Config dump failed (' + r.status + ')'));
+      });
+    })
+    .then(function(blob) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'kiln-config-dump.tar.gz';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+    })
+    .catch(function(err) {
+      showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> ' + err.message, 'error', 8000);
+    });
+}
+
+/* ---------------------------------------------------------------------------
+   Firing CSV export - past firings stored in the controller database.
+   The dropdown lists the last few firings (most recent first); the
+   download hits /api/firings/<id>/csv which renders the stored
+   samples to csv server-side on a worker thread.
+--------------------------------------------------------------------------- */
+
+function shortStamp(s) {
+    // "2026-08-12 22:20:38,992" -> "2026-08-12 22:20:38"
+    return String(s == null ? '' : s).split(',')[0];
+}
+
+// pure: one dropdown row. shows the firing's start and end wall-clock
+// times plus its length and sample count, e.g.
+// "#16 cone-05-long-bisque — 2026-08-12 22:20:38 → 2026-08-13 07:15:04 (8:54:25, 16017 samples)"
+function firingLabel(f) {
+    var when = shortStamp(f.start) || ('firing ' + f.id);
+    if (f.end) { when += ' \u2192 ' + shortStamp(f.end); }
+    var extra = f.samples + ' samples';
+    if (f.duration) { extra = formatDuration(f.duration) + ', ' + extra; }
+    return '#' + f.id + ' ' + f.profile + ' \u2014 ' + when + ' (' + extra + ')';
+}
+
+function loadFirings() {
+  var sel = $('firing_select');
+  if (!sel) { return; }
+  if (firings_poll_timer) {
+    clearTimeout(firings_poll_timer);
+    firings_poll_timer = null;
+  }
+  sel.innerHTML = '<option value="">Loading firings&hellip;</option>';
+  fetch('/api/firings')
+    .then(function(r) { return r.json(); })
+    .then(function(resp) {
+      if (!resp || !resp.success) {
+        throw new Error((resp && resp.error) || 'unknown error');
+      }
+      renderFirings(resp);
+    })
+    .catch(function(err) {
+      sel.innerHTML = '<option value="">Could not load firings</option>';
+      setFiringStatus('Could not load firings: ' + err);
+      showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> Could not load firings: ' + err, 'error', 5000);
+    });
+}
+
+var firings_poll_timer = null;
+
+function setFiringStatus(text) {
+  var el = $('firing_status');
+  if (el) { el.innerHTML = text; }
+}
+
+function renderFirings(resp) {
+  var sel = $('firing_select');
+  if (!sel) { return; }
+  var rows = resp.firings || [];
+  if (rows.length === 0) {
+    sel.innerHTML = '<option value="">' +
+      (resp.refreshing ? 'Building firing list in the background&hellip;'
+                       : 'No firings recorded yet') +
+      '</option>';
+  } else {
+    // the listing arrives newest first, so the latest firing is on
+    // top and selected by default
+    sel.innerHTML = rows.map(function(f) {
+      return '<option value="' + f.id + '">' + escHtml(firingLabel(f)) + '</option>';
+    }).join('');
+  }
+  if (resp.error) {
+    setFiringStatus('Last background read failed: ' + escHtml(resp.error));
+  } else if (resp.refreshing) {
+    setFiringStatus('Loading the firing list&hellip;');
+  } else if (resp.updated) {
+    var ago = Math.max(0, Date.now() / 1000 - resp.updated);
+    setFiringStatus('Firing list read from the database ' + formatDuration(ago) + ' ago.');
+  }
+  // while the background read runs, re-check until it lands
+  if (resp.refreshing) {
+    if (firings_poll_timer) { clearTimeout(firings_poll_timer); }
+    firings_poll_timer = setTimeout(loadFirings, 10000);
+  }
+}
+
+function refreshFirings() {
+  setFiringStatus('Refreshing the firing list&hellip;');
+  fetch('/api/firings/refresh', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function() { loadFirings(); })
+    .catch(function(err) {
+      showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> Could not refresh firings: ' + err, 'error', 5000);
+    });
+}
+
+function downloadFiringCsv() {
+  var sel = $('firing_select');
+  var id = sel ? sel.value : '';
+  if (!id) {
+    showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> No firing selected.', 'error', 5000);
+    return;
+  }
+  fetch('/api/firings/' + encodeURIComponent(id) + '/csv')
+    .then(function(r) {
+      if (r.ok) {
+        var filename = 'firing-' + id + '.csv';
+        var disp = r.headers.get('Content-Disposition');
+        if (disp) {
+          var m = disp.match(/filename="([^"]+)"/);
+          if (m) { filename = m[1]; }
+        }
+        return r.blob().then(function(blob) {
+          return { blob: blob, filename: filename };
+        });
+      }
+      return r.json().then(function(err) {
+        throw new Error((err && err.error) || ('Firing CSV download failed (' + r.status + ')'));
+      });
+    })
+    .then(function(res) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(res.blob);
+      a.download = res.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+    })
+    .catch(function(err) {
+      showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> ' + err.message, 'error', 8000);
+    });
+}
+
+/* ---------------------------------------------------------------------------
+   Init
+--------------------------------------------------------------------------- */
+
+function init()
+{
+    if(!("WebSocket" in window))
+    {
+        showGrowl("Your browser does not support WebSockets. Please use a modern browser.", 'error', 0);
+        return;
+    }
+
+    createChart();
+
+    var icon = $('theme_icon');
+    if (icon) {
+        icon.className = currentTheme() === 'light' ? 'bi bi-sun' : 'bi bi-moon-stars';
+    }
+
+    // tab switching
+    var links = document.querySelectorAll('.nav-link[data-tab]');
+    for (var li = 0; li < links.length; li++) {
+        (function(link) {
+            link.addEventListener('click', function() {
+                var tab = link.getAttribute('data-tab');
+                showTab(tab);
+                history.replaceState(null, '', '#' + tab);
+            });
+        })(links[li]);
+    }
+    window.addEventListener('hashchange', openTabFromHash);
+
+    $('window_slider').addEventListener('input', tune_window_change);
+
+    // link the schedule table back to the graph
+    $('profile_table').addEventListener('change', function(e)
+    {
+        var t = e.target;
+        if (!t.id || t.id.indexOf('profiletable-') !== 0) { return; }
+        var id = t.id;
+        var value = parseInt(t.value);
+        var fields = id.split("-");
+        var col = parseInt(fields[1]);
+        var row = parseInt(fields[2]);
+
+        if (graph.profile.data.length > 0) {
+            if (col == 0) {
+                graph.profile.data[row][col] = timeProfileFormatter(value,false);
+            }
+            else {
+                graph.profile.data[row][col] = value;
+            }
+            syncChartData();
+            updateAxis();
+        }
+        updateProfileTable();
+    });
+
+    // Status Socket ////////////////////////////////
+
+    ws_status.onopen = function()
+    {
+        console.log("Status Socket has been opened");
+        socket_opened('status');
+    };
+
+    ws_status.onclose = function()
+    {
+        if (!window.status_socket_was_lost) {
+            window.status_socket_was_lost = true;
+            showGrowl("<i class=\"bi bi-exclamation-triangle-fill\"></i> <b>ERROR 1:</b><br/>Status Websocket not available", 'error', 5000);
+        }
+        socket_closed('status');
+        schedule_reconnect('status');
+    };
+
+    ws_status.onmessage = function(e)
+    {
+        var x = JSON.parse(e.data);
+
+        // keep the latest oven state around so the schedule dialog can
+        // offer to chain a firing after the one in progress.
+        if (x.state) { oven_status = x; }
+
+        // freshness of this tick against the history watermark: a tick
+        // at or below last_sample_time duplicates backfilled history.
+        // computed once so the overview series and the details feed
+        // below agree on whether to store it (displays update either way).
+        var _st = (x.pidstats && x.pidstats.time !== undefined && x.pidstats.time !== null) ? x.pidstats.time : null;
+        var _is_new_sample = (_st === null || _st === undefined || _st > last_sample_time);
+
+        if (x.type == "backlog")
+        {
+            // the backlog is the first message sent to a new client, so it
+            // identifies the run already in progress. adopt it without
+            // clearing stored data, so a page refresh mid-run is not lost.
+            var adopting_run = x.run_started && x.run_started !== run_started;
+            run_started = x.run_started || null;
+
+            if (!x.run_started)
+            {
+                // the server has no run in progress, so any stored details
+                // belong to a previous firing. wipe them.
+                clear_persisted_all();
+            }
+            else if (adopting_run)
+            {
+                // this client connected (or reconnected) into a firing that
+                // started while it was away. drop stored details older than
+                // the run start so the details page never shows artifacts
+                // from an earlier firing.
+                prune_persisted_all(x.run_started);
+            }
+
+            if (x.profile)
+            {
+                backlog_profile_name = typeof x.profile == 'object' ? x.profile.name : x.profile;
+                adoptProfile(backlog_profile_name);
+            }
+
+            // a (re)connect only starts receiving live ticks from now;
+            // backfill the firing's history from the db so graphs show
+            // the whole run, not just the tail. the merge is idempotent
+            // (watermark dedupe), so reconnects just close the gap.
+            if (x.run_started) {
+                backfillHistory(x.run_started);
+            }
+        }
+
+        // a new run_started means a fresh firing has begun, no matter
+        // how it was started (start button, scheduled run, api command,
+        // automatic restart). wipe the stored details data and load the
+        // reported profile so the main page reflects the actual run.
+        if (x.run_started && x.run_started !== run_started) {
+            run_started = x.run_started;
+            clear_persisted_all();
+            if (x.profile) {
+                adoptProfile(typeof x.profile == 'object' ? x.profile.name : x.profile);
+            }
+            // the first ticks of a new run may predate this fetch;
+            // backfill picks up whatever the db already recorded.
+            backfillHistory(x.run_started);
+        }
+
+        // track which schedule is running so the Saved Schedules list
+        // can show a status. re-render only when it changes.
+        running_profile_name = (x.state == "RUNNING" || x.state == "PAUSED") ? (x.profile || null) : null;
+        if (running_profile_name !== running_profile_name_last) {
+            running_profile_name_last = running_profile_name;
+            if (!running_profile_name) { backlog_profile_name = null; }
+            renderProfiles();
+        }
+
+        if(state!="EDIT")
+        {
+            state = x.state;
+            updateOverviewStatus();
+            if (state!=state_last)
+            {
+                if(state_last == "RUNNING" && state != "PAUSED" )
+                {
+                    showGrowl("<i class=\"bi bi-exclamation-triangle-fill\"></i> <b>Run completed</b>", 'success', 0);
+                }
+            }
+
+            if(state=="RUNNING" || state=="TUNING")
+            {
+                updateSelectedProfileLabel();
+
+                // skip samples already covered by a history backfill
+                // (reconnect overlap): displays below still update.
+                if (_is_new_sample) {
+                    if (_st !== null && _st !== undefined && _st > last_sample_time) { last_sample_time = _st; }
+                    graph.live.data.push([x.runtime, x.temperature, _st]);
+                    syncChartData();
+                    updateAxis();
+                }
+
+                var left = parseInt(x.totaltime-x.runtime);
+                var eta = formatDuration(left);
+
+                $('eta').innerHTML = eta;
+                if (left > 0) {
+                    $('completes').innerHTML = unix_to_yymmdd_hhmmss(Date.now() / 1000 + left);
+                } else {
+                    $('completes').innerHTML = '--';
+                }
+            }
+            else
+            {
+                updateSelectedProfileLabel();
+                $('eta').innerHTML = '--:--:--';
+                $('completes').innerHTML = '--';
+            }
+
+            state_last = state;
+
+        }
+
+        // overview header temps: Actual always tracks the live sensor
+        // so it stays visible while the kiln cools after a firing.
+        // Set Point only applies while a schedule (or tuning) is driving
+        // the kiln; when idle there is no set point, so show '--' instead
+        // of the reset 0 value. pidstats is the fallback when the
+        // top-level fields are missing.
+        var _ovTemp = (x.temperature !== undefined ? x.temperature : (x.pidstats ? x.pidstats.ispoint : undefined));
+        var _ovTarget = (x.target !== undefined ? x.target : (x.pidstats ? x.pidstats.setpoint : undefined));
+        if (x.state !== undefined && x.state !== "RUNNING" && x.state !== "PAUSED" && x.state !== "TUNING") {
+            _ovTarget = '--';
+        }
+        if (_ovTemp !== undefined || _ovTarget !== undefined) {
+            updateOverviewTemps(_ovTemp, _ovTarget);
+        }
+
+        // tuning feed
+        if (x.pidstats && x.pidstats.time) {
+            x.pidstats["datetime"] = unix_to_yymmdd_hhmmss(x.pidstats.time);
+            x.pidstats.err = x.pidstats.err * -1;
+            x.pidstats.out = x.pidstats.out * 100;
+            x.pidstats.catching_up = x.catching_up;
+            x.pidstats.temp_errors = x.temp_errors;
+            if (x.catching_up == true) {
+                x.pidstats.catchingup = x.pidstats.ispoint;
+            }
+            // same watermark as the overview series: a live tick that
+            // duplicates backfilled history updates the displays but is
+            // not stored twice (_is_new_sample is shared so both feeds
+            // store a fresh tick exactly once).
+            if (_is_new_sample) {
+                last_sample_time = x.pidstats.time;
+                all.push(x.pidstats);
+                persist_all();
+            }
+
+            if (detailsInited) {
+                drawall(windowed_data());
+            }
+
+            $("error-current").innerHTML = rnd(x.pidstats.err);
+            $("error-1min").innerHTML = rnd(average("err", 1, all));
+            $("error-5min").innerHTML = rnd(average("err", 5, all));
+            $("error-15min").innerHTML = rnd(average("err", 15, all));
+            $("temp").innerHTML = rnd(x.pidstats.ispoint);
+            $("target").innerHTML = rnd(x.pidstats.setpoint);
+            $("heat-pct").innerHTML = rnd(x.pidstats.out);
+            $("catching-up").innerHTML = rnd(percent_catching_up(all));
+            $("time-catchup").innerHTML = formatDuration(catching_up_seconds(all));
+        }
+
+        // during tuning, pidstats may be stale -- use top-level state
+        if (x.state === "TUNING" && x.temperature !== undefined) {
+            $("temp").innerHTML = rnd(x.temperature);
+            $("target").innerHTML = rnd(x.target);
+            var ts = x.time_step || 1;
+            $("heat-pct").innerHTML = rnd((x.heat || 0) / ts * 100);
+        }
+
+        // run cost: kwh_rate * kw_elements accumulated element-on seconds,
+        // computed server-side each tick (see Oven.update_cost)
+        if (x.cost !== undefined && x.cost !== null) {
+            $("cost").innerHTML = Number(x.cost).toFixed(2);
+            $("cost-currency").innerHTML = x.currency_type || '$';
+        }
+
+        // details TIME box: elapsed is wall-clock time since the
+        // firing started. x.runtime is schedule progress, not actual
+        // elapsed time, so it cannot be used here. run_started is
+        // stamped by the server when the run begins and goes stale
+        // once the run ends, so only show it while a firing is active.
+        if ((x.state === "RUNNING" || x.state === "PAUSED") && x.run_started) {
+            $("time-elapsed").innerHTML = formatDuration(Date.now() / 1000 - x.run_started);
+        } else {
+            $("time-elapsed").innerHTML = '--:--:--';
+        }
+    };
+
+    // Config Socket /////////////////////////////////
+
+    ws_config.onopen = function()
+    {
+        ws_config.send('GET');
+        socket_opened('config');
+    };
+
+    ws_config.onclose = function()
+    {
+        socket_closed('config');
+        schedule_reconnect('config');
+    };
+
+    ws_config.onmessage = function(e)
+    {
+        var x = JSON.parse(e.data);
+        temp_scale = x.temp_scale;
+        time_scale_slope = x.time_scale_slope;
+        time_scale_profile = x.time_scale_profile;
+        kwh_rate = x.kwh_rate;
+        currency_type = x.currency_type;
+
+        if (temp_scale == "c") {temp_scale_display = "C";} else {temp_scale_display = "F";}
+        var heatRateUnits = $('heat-rate-units');
+        if (heatRateUnits) {
+            heatRateUnits.innerHTML = '&deg;' + temp_scale_display + '/hr';
+        }
+
+        simulate = x.simulate;
+        toggleSimBadge(simulate);
+
+        if (x.github_sharing_enabled !== undefined) {
+            upload_enabled = x.github_sharing_enabled;
+            var shareRow = $('share_profile_row');
+            if (shareRow) { shareRow.style.display = upload_enabled ? '' : 'none'; }
+        }
+
+        switch(time_scale_profile){
+            case "s":
+                time_scale_long = "Seconds";
+                break;
+            case "m":
+                time_scale_long = "Minutes";
+                break;
+            case "h":
+                time_scale_long = "Hours";
+                break;
+        }
+
+    }
+
+    // Control Socket ////////////////////////////////
+
+    ws_control.onopen = function()
+    {
+        socket_opened('control');
+    };
+
+    ws_control.onclose = function()
+    {
+        socket_closed('control');
+        schedule_reconnect('control');
+    };
+
+    ws_control.onmessage = function(e)
+    {
+        var x = JSON.parse(e.data);
+        graph.live.data.push([x.runtime, x.temperature]);
+        syncChartData();
+        updateAxis();
+    }
+
+    // Storage Socket ///////////////////////////////
+
+    ws_storage.onopen = function()
+    {
+        ws_storage.send('GET');
+        socket_opened('storage');
+    };
+
+    ws_storage.onclose = function()
+    {
+        socket_closed('storage');
+        schedule_reconnect('storage');
+    };
+
+    ws_storage.onmessage = function(e)
+    {
+        var message = JSON.parse(e.data);
+
+        if(message.resp)
+        {
+            if(message.resp == "FAIL")
+            {
+                if (message.error) {
+                    showGrowl('<i class="bi bi-exclamation-triangle-fill"></i> <b>ERROR 94:</b><br/>Could not save schedule: ' + escHtml(message.error), 'error', 8000);
+                }
+                else if (confirm('Overwrite?'))
+                {
+                    message.force=true;
+                    ws_storage.send(JSON.stringify(message));
+                }
+            }
+
+            return;
+        }
+
+        //the message is an array of profiles
+        //FIXME: this should be better, maybe a {"profiles": ...} container?
+        profiles = message;
+        var valid_profile_names = profiles.map(function(a) {return a.name;});
+        // if a run is in progress, keep the currently running profile
+        // selected instead of defaulting to the first one
+        var running_name = running_profile_name || backlog_profile_name;
+        if (running_name && valid_profile_names.indexOf(running_name) !== -1) {
+            selected_profile_name = running_name;
+        }
+        // check if current selected value is a valid profile name
+        // if not, update with first available profile name
+        if (
+          valid_profile_names.length > 0 &&
+          valid_profile_names.indexOf(selected_profile_name) === -1
+        ) {
+          selected_profile = 0;
+          selected_profile_name = valid_profile_names[0];
+        }
+
+        var matched = false;
+        for (var i=0; i<profiles.length; i++)
+        {
+            if (profiles[i].name == selected_profile_name)
+            {
+                selected_profile = i;
+                updateProfile(i);
+                matched = true;
+            }
+        }
+
+        if (!matched && profiles.length > 0) {
+            selected_profile = 0;
+            updateProfile(0);
+        }
+
+        renderProfiles();
+    };
+}
+
+init();
+openTabFromHash();

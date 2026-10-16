@@ -9,7 +9,10 @@ requests
 # for folks running raspberry pis
 # we have no proof of anyone using another board yet, but when that 
 # happens, you might want to comment this out.
-RPi.GPIO
+# rpi-lgpio provides the RPi.GPIO module that adafruit blinka
+# depends on, and works with newer kernels/Pi models where the
+# original RPi.GPIO package is unmaintained.
+rpi-lgpio
 
 # List of all supported adafruit modules for thermocouples
 adafruit-circuitpython-max31855
@@ -24,7 +27,5 @@ adafruit-circuitpython-bitbangio
 # untested - for mcp9600 and mcp9601
 #adafruit-circuitpython-mcp9600
 
-# Google Sheets API dependencies
-google-api-python-client
-google-auth-oauthlib
-google-auth-httplib2
+# mqtt telemetry (optional - only used when mqtt_enable is set in config.py)
+paho-mqtt

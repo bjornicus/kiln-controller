@@ -81,11 +81,11 @@ currency_type   = "$"   # Currency Symbol to show when calculating cost to run j
 
 try:
     import board
-    spi_sclk  = board.D17    #spi clock
-    spi_miso  = board.D27    #spi Microcomputer In Serial Out
-    spi_cs    = board.D22    #spi Chip Select
+    spi_sclk  = board.D22    #spi clock
+    spi_miso  = board.D17    #spi Microcomputer In Serial Out
+    spi_cs    = board.D27    #spi Chip Select
     spi_mosi  = board.D10    #spi Microcomputer Out Serial In (not connected) 
-    gpio_heat = board.D23    #output that controls relay
+    gpio_heat = board.D26    #output that controls relay
     gpio_heat_invert = False #invert the output state
 except (NotImplementedError,AttributeError):
     print("not running on blinka recognized board, probably a simulation")
@@ -137,15 +137,15 @@ sensor_time_wait = 2
 # well with the simulated oven. You must tune them to work well with 
 # your specific kiln. Note that the integral pid_ki is
 # inverted so that a smaller number means more integral action.
-pid_kp = 4.112
-pid_ki = 32.972
-pid_kd = 139.384
+pid_kp = 11.55
+pid_ki = 22.2339
+pid_kd = 742.429
 
 
 ########################################################################
 #
 #   Simulation parameters
-simulate = True
+simulate = False
 sim_t_env      = 65   # deg
 sim_c_heat     = 500.0  # J/K  heat capacity of heat element
 sim_c_oven     = 5000.0 # J/K  heat capacity of oven
@@ -195,7 +195,7 @@ emergency_heat_rate_window = 22.5 # minutes
 # If the current temperature is outside the pid control window,
 # delay the schedule until it does back inside. This allows for heating
 # and cooling as fast as possible and not continuing until temp is reached.
-kiln_must_catch_up = True
+kiln_must_catch_up = False
 
 # This setting is required. 
 # This setting defines the window within which PID control occurs.
@@ -244,8 +244,8 @@ ignore_tc_cold_junction_temp_low = False
 ignore_tc_temp_high = False
 ignore_tc_temp_low = False
 ignore_tc_voltage_error = False
-ignore_tc_short_errors = False 
-ignore_tc_unknown_error = False
+ignore_tc_short_errors = True
+ignore_tc_unknown_error = True
 
 # This overrides all possible thermocouple errors and prevents the 
 # process from exiting.

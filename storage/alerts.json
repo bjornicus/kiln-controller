@@ -1,0 +1,24 @@
+{
+    "delivery": {
+        "mqtt_enabled": false,
+        "mqtt_topic": "kiln/alert",
+        "webhook_enabled": true,
+        "webhook_url": "https://ntfy.sh/bjorn-kilntroll"
+    },
+    "enabled": {
+        "catch_up_stalled": true,
+        "controller_restarted": true,
+        "cooled_safe": true,
+        "emergency_shutoff": true,
+        "heat_rate_too_low": true,
+        "relay_stuck_on": true,
+        "restart_not_resumed": true,
+        "restart_resumed": true,
+        "run_aborted": true,
+        "run_completed": true,
+        "run_started": true,
+        "scheduled_run_missed": true,
+        "tc_failure": true,
+        "temp_implausible": true
+    }
+}
